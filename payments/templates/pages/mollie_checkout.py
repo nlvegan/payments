@@ -1,3 +1,6 @@
+# Copyright (c) 2024, Frappe Technologies Pvt. Ltd. and contributors
+# License: MIT. See LICENSE
+
 import json
 
 import frappe
@@ -9,6 +12,13 @@ from payments.payment_gateways.doctype.mollie_settings.mollie_settings import (
 )
 
 no_cache = 1
+
+# Doctypes that are allowed to be used with Mollie payments.
+# This prevents arbitrary document manipulation via the guest-accessible endpoint.
+# Add additional doctypes here as needed for your use case.
+ALLOWED_PAYMENT_DOCTYPES = (
+	"Payment Request",
+)
 
 expected_keys = (
 	"amount",
@@ -64,24 +74,32 @@ def get_header_image(doc, gateway_controller):
 
 @frappe.whitelist(allow_guest=True)
 def make_payment(data, reference_doctype, reference_docname):
+	# Validate reference_doctype to prevent arbitrary document manipulation
+	if reference_doctype not in ALLOWED_PAYMENT_DOCTYPES:
+		frappe.throw(
+			_("Invalid reference doctype for Mollie payment: {0}").format(reference_doctype),
+			frappe.PermissionError,
+		)
+
 	data = json.loads(data)
 	gateway_controller = get_gateway_controller(reference_doctype, reference_docname)
-	paymentID = frappe.db.get_value(reference_doctype, reference_docname, 'payment_id')
-	
+	paymentID = frappe.db.get_value(reference_doctype, reference_docname, "payment_id")
+
 	if not paymentID:
 		data = frappe.get_doc("Mollie Settings", gateway_controller).create_request(data)
 		paymentID = data["paymentID"]
-	
+
 	status = frappe.get_doc("Mollie Settings", gateway_controller).check_request(data, paymentID)
 	data["paymentUrl"] = status["paymentUrl"]
 
+	# Check if payment was already completed (stored locally)
 	try:
-		status_field = frappe.db.get_value(reference_doctype, reference_docname, 'payment_status')
+		status_field = frappe.db.get_value(reference_doctype, reference_docname, "payment_status")
 		if status_field == "Completed":
 			status["status"] = status_field
-	except:
-		pass
-	
+	except frappe.exceptions.DoesNotExistError:
+		pass  # Field doesn't exist on this doctype
+
 	if status["status"] == "Cancelled":
 		data = frappe.get_doc("Mollie Settings", gateway_controller).create_request(data)
 		paymentID = data["paymentID"]
@@ -92,10 +110,9 @@ def make_payment(data, reference_doctype, reference_docname):
 		status = status["status"]
 		data["status"] = status
 
-	try:
-		frappe.db.set_value(reference_doctype, reference_docname, 'payment_status', status)
-	except:
-		pass
-	
+	# Update payment status on reference document if field exists
+	if frappe.get_meta(reference_doctype).has_field("payment_status"):
+		frappe.db.set_value(reference_doctype, reference_docname, "payment_status", status)
+
 	frappe.db.commit()
 	return data

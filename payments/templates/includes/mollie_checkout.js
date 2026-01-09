@@ -1,4 +1,4 @@
-+$(document).ready(function() {
+$(document).ready(function() {
 	var form = document.querySelector('#payment-form');
 	var data = {{ frappe.form_dict | json }};
 	var doctype = "{{ reference_doctype }}"

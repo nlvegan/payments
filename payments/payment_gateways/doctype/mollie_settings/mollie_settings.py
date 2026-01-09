@@ -1,3 +1,6 @@
+# Copyright (c) 2024, Frappe Technologies Pvt. Ltd. and contributors
+# License: MIT. See LICENSE
+
 from urllib.parse import urlencode
 
 import frappe
@@ -5,12 +8,11 @@ from frappe import _
 from frappe.integrations.utils import create_request_log, make_get_request
 from frappe.model.document import Document
 from frappe.utils import call_hook_method, get_url
-from payments.utils import create_payment_gateway
+
 from mollie.api.client import Client
 from mollie.api.error import Error
 
-mollie_client = Client()
-mollie_error = Error()
+from payments.utils import create_payment_gateway
 
 class MollieSettings(Document):
 	supported_currencies = [
@@ -78,9 +80,15 @@ class MollieSettings(Document):
 	def get_payment_url(self, **kwargs):
 		return get_url(f"mollie_checkout?{urlencode(kwargs)}")
 
+	def get_mollie_client(self):
+		"""Create and return a new Mollie client instance with API key set."""
+		client = Client()
+		client.set_api_key(self.get_password(fieldname="secret_key", raise_exception=False))
+		return client
+
 	def create_request(self, data):
 		self.data = frappe._dict(data)
-		api = mollie_client.set_api_key(self.get_password(fieldname="secret_key", raise_exception=False))
+		self.mollie_client = self.get_mollie_client()
 
 		try:
 			self.integration_request = create_request_log(self.data, service_name="Mollie")
@@ -99,81 +107,85 @@ class MollieSettings(Document):
 			}
 
 	def check_request(self, data, paymentID):
-		mollie_client.set_api_key(self.get_password(fieldname="secret_key", raise_exception=False))
+		mollie_client = self.get_mollie_client()
 		try:
 			payment = mollie_client.payments.get(paymentID)
 			paymentUrl = "Unavailable"
-		
+
 			if payment.is_paid():
 				status = "Completed"
 			elif payment.is_pending():
 				status = "Pending"
-				if 'checkout' in payment['_links']:
-					paymentUrl = payment['_links']['checkout']['href']
+				if "checkout" in payment["_links"]:
+					paymentUrl = payment["_links"]["checkout"]["href"]
 				else:
 					status = "Cancelled"
 			elif payment.is_open():
 				status = "Open"
-				if 'checkout' in payment['_links']:
-					paymentUrl = payment['_links']['checkout']['href']
+				if "checkout" in payment["_links"]:
+					paymentUrl = payment["_links"]["checkout"]["href"]
 				else:
 					status = "Cancelled"
 			else:
 				status = "Cancelled"
-			
+
 			return {"paymentUrl": paymentUrl, "status": status}
 
 		except Exception:
-			frappe.log_error(frappe.get_traceback()[:140])
-			return f"API call failed"
+			frappe.log_error(frappe.get_traceback())
+			return {"paymentUrl": "Unavailable", "status": "Error"}
 
 	def create_charge_on_mollie(self):
 		try:
 			data_details = {
-					"amount": self.data.amount,
-					"title": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
-					"description": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
-					"reference_doctype": self.data.reference_doctype,
-					"reference_docname": self.data.reference_docname,
-					"payer_email": frappe.session.user,
-					"payer_name": frappe.utils.get_fullname(frappe.session.user),
-					"order_id": self.data.reference_docname,
-					"currency": self.data.currency,
-					"redirect_to": self.data.get("redirect_to"),
-				}
+				"amount": self.data.amount,
+				"title": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
+				"description": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
+				"reference_doctype": self.data.reference_doctype,
+				"reference_docname": self.data.reference_docname,
+				"payer_email": frappe.session.user,
+				"payer_name": frappe.utils.get_fullname(frappe.session.user),
+				"order_id": self.data.reference_docname,
+				"currency": self.data.currency,
+				"redirect_to": self.data.get("redirect_to"),
+			}
 			redirect_url = self.get_payment_url(**data_details)
-			email = frappe.db.get_value(self.data.reference_doctype, self.data.reference_docname, 'email')
+			email = frappe.db.get_value(
+				self.data.reference_doctype, self.data.reference_docname, "email"
+			)
 			if email:
 				self.data.payer_email = email
 
 			charge_data = {
-                'amount': {
-                    'currency': self.data.currency,
-                    'value': "{:.2f}".format(float(self.data.amount))
-                },
-                "description": self.data.description,
-                'redirectUrl': redirect_url,
-            }
+				"amount": {
+					"currency": self.data.currency,
+					"value": "{:.2f}".format(float(self.data.amount)),
+				},
+				"description": self.data.description,
+				"redirectUrl": redirect_url,
+			}
 
-			if self.data.payer_email and not self.data.payer_email == "Guest" and frappe.utils.validate_email_address(self.data.payer_email):
-				charge_data['billingAddress'] = {
-					'email': self.data.payer_email
-				}
+			if (
+				self.data.payer_email
+				and self.data.payer_email != "Guest"
+				and frappe.utils.validate_email_address(self.data.payer_email)
+			):
+				charge_data["billingAddress"] = {"email": self.data.payer_email}
 
-			charge = mollie_client.payments.create(charge_data)
+			charge = self.mollie_client.payments.create(charge_data)
 
-			frappe.db.set_value(self.data.reference_doctype, self.data.reference_docname, 'payment_id', charge.id)
-		
+			frappe.db.set_value(
+				self.data.reference_doctype, self.data.reference_docname, "payment_id", charge.id
+			)
+
 		except Exception:
-			if mollie_error:
-				frappe.log_error(mollie_error)
-			
 			frappe.log_error(frappe.get_traceback())
+			raise
 
 		data2 = self.finalize_request()
 		data2.update(paymentID=charge.id)
 		data2.update(paymentUrl=charge.checkout_url)
-		
+
 		return data2
 
 	def finalize_request(self):
