@@ -7,7 +7,7 @@ import frappe
 from frappe import _
 from frappe.utils import fmt_money
 
-from payments.payment_gateways.doctype.mollie_settings.mollie_settings import (
+from payments.payment_gateways.doctype.mollie_checkout_settings.mollie_checkout_settings import (
 	get_gateway_controller,
 )
 
@@ -60,12 +60,12 @@ def get_context(context):
 
 def get_profile_id(doc, gateway_controller):
 	"""Get the appropriate Mollie profile ID (sandbox or live)."""
-	mollie_settings = frappe.get_doc("Mollie Settings", gateway_controller)
+	mollie_settings = frappe.get_doc("Mollie Checkout Settings", gateway_controller)
 	return mollie_settings.get_active_profile_id()
 
 
 def get_header_image(doc, gateway_controller):
-	return frappe.db.get_value("Mollie Settings", gateway_controller, "header_img")
+	return frappe.db.get_value("Mollie Checkout Settings", gateway_controller, "header_img")
 
 
 @frappe.whitelist(allow_guest=True)
@@ -82,10 +82,10 @@ def make_payment(data, reference_doctype, reference_docname):
 	paymentID = frappe.db.get_value(reference_doctype, reference_docname, "payment_id")
 
 	if not paymentID:
-		data = frappe.get_doc("Mollie Settings", gateway_controller).create_request(data)
+		data = frappe.get_doc("Mollie Checkout Settings", gateway_controller).create_request(data)
 		paymentID = data["paymentID"]
 
-	status = frappe.get_doc("Mollie Settings", gateway_controller).check_request(data, paymentID)
+	status = frappe.get_doc("Mollie Checkout Settings", gateway_controller).check_request(data, paymentID)
 	data["paymentUrl"] = status["paymentUrl"]
 
 	# Check if payment was already completed (stored locally)
@@ -97,7 +97,7 @@ def make_payment(data, reference_doctype, reference_docname):
 		pass  # Field doesn't exist on this doctype
 
 	if status["status"] == "Cancelled":
-		data = frappe.get_doc("Mollie Settings", gateway_controller).create_request(data)
+		data = frappe.get_doc("Mollie Checkout Settings", gateway_controller).create_request(data)
 		paymentID = data["paymentID"]
 		status = "Open"
 		data["status"] = status

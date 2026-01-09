@@ -16,7 +16,7 @@ from payments.utils import create_payment_gateway
 from payments.utils.utils import log_payment_error
 
 
-class MollieSettings(Document):
+class MollieCheckoutSettings(Document):
 	supported_currencies = [
 		"AED",
 		"AUD",
@@ -52,7 +52,7 @@ class MollieSettings(Document):
 	def on_update(self):
 		create_payment_gateway(
 			"Mollie-" + self.gateway_name,
-			settings="Mollie Settings",
+			settings="Mollie Checkout Settings",
 			controller=self.gateway_name,
 		)
 		call_hook_method("payment_gateway_enabled", gateway="Mollie-" + self.gateway_name)
