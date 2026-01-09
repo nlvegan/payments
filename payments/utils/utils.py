@@ -6,6 +6,88 @@ from frappe import _
 from frappe.custom.doctype.custom_field.custom_field import create_custom_fields
 
 
+class PaymentGatewayError(Exception):
+	"""Base exception for payment gateway errors."""
+
+	def __init__(self, message, gateway=None, original_error=None):
+		self.gateway = gateway
+		self.original_error = original_error
+		super().__init__(message)
+
+
+def log_payment_error(gateway: str, error: Exception, context: dict | None = None):
+	"""Log a payment gateway error with context.
+
+	Args:
+		gateway: Name of the payment gateway (e.g., "Mollie", "Stripe")
+		error: The exception that occurred
+		context: Optional dict with additional context (e.g., payment_id, amount)
+	"""
+	error_message = f"{gateway} Payment Error: {str(error)}"
+	if context:
+		error_message += f"\nContext: {context}"
+
+	frappe.log_error(
+		message=frappe.get_traceback(),
+		title=error_message[:140],  # Title has length limit
+	)
+
+
+def handle_payment_gateway_error(
+	gateway: str,
+	error: Exception,
+	context: dict | None = None,
+	raise_error: bool = True,
+):
+	"""Handle a payment gateway error consistently.
+
+	Args:
+		gateway: Name of the payment gateway
+		error: The exception that occurred
+		context: Optional dict with additional context
+		raise_error: Whether to re-raise after logging (default True)
+
+	Returns:
+		dict with error information if raise_error is False
+	"""
+	log_payment_error(gateway, error, context)
+
+	error_response = {
+		"success": False,
+		"error": str(error),
+		"gateway": gateway,
+	}
+
+	if raise_error:
+		raise PaymentGatewayError(
+			f"{gateway} error: {str(error)}",
+			gateway=gateway,
+			original_error=error,
+		)
+
+	return error_response
+
+
+@contextmanager
+def payment_error_handler(gateway: str, context: dict | None = None, reraise: bool = True):
+	"""Context manager for handling payment gateway errors.
+
+	Usage:
+		with payment_error_handler("Mollie", {"payment_id": "tr_xxx"}):
+			# API call that might fail
+			payment = client.payments.get(payment_id)
+
+	Args:
+		gateway: Name of the payment gateway
+		context: Optional dict with additional context for logging
+		reraise: Whether to re-raise the error after logging (default True)
+	"""
+	try:
+		yield
+	except Exception as e:
+		handle_payment_gateway_error(gateway, e, context, raise_error=reraise)
+
+
 def validate_integration_request(docname: str | None):
 	if frappe.db.get_value("Integration Request", docname, "status") == "Cancelled":
 		frappe.throw(_("Expired Token"))

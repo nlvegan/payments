@@ -7,12 +7,14 @@ import frappe
 from frappe import _
 from frappe.integrations.utils import create_request_log, make_get_request
 from frappe.model.document import Document
-from frappe.utils import call_hook_method, get_url
+from frappe.utils import call_hook_method, cint, get_url
 
 from mollie.api.client import Client
-from mollie.api.error import Error
+from mollie.api.error import Error as MollieError
 
 from payments.utils import create_payment_gateway
+from payments.utils.utils import log_payment_error
+
 
 class MollieSettings(Document):
 	supported_currencies = [
@@ -58,16 +60,17 @@ class MollieSettings(Document):
 			self.validate_mollie_credentials()
 
 	def validate_mollie_credentials(self):
-		if self.profile_id and self.secret_key:
-			header = {
-				"Authorization": "Bearer {}".format(
-					self.get_password(fieldname="secret_key", raise_exception=False)
-				)
-			}
+		"""Validate the currently active API credentials (sandbox or live)."""
+		api_key = self.get_api_key()
+		if api_key:
+			header = {"Authorization": f"Bearer {api_key}"}
 			try:
 				make_get_request(url="https://api.mollie.com/v2/payments", headers=header)
 			except Exception:
-				frappe.throw(_("Seems Publishable Key or Secret Key is wrong !!!"))
+				mode = "sandbox" if self.is_sandbox_mode() else "live"
+				frappe.throw(
+					_("Mollie API validation failed. Please check your {0} credentials.").format(mode)
+				)
 
 	def validate_transaction_currency(self, currency):
 		if currency not in self.supported_currencies:
@@ -77,13 +80,65 @@ class MollieSettings(Document):
 				).format(currency)
 			)
 
+	def is_sandbox_mode(self):
+		"""Check if sandbox mode is enabled.
+
+		Returns True if:
+		- use_sandbox checkbox is checked in the DocType, OR
+		- use_sandbox is passed in the request form_dict
+		"""
+		return cint(self.use_sandbox) or cint(frappe.form_dict.get("use_sandbox"))
+
+	def get_api_key(self):
+		"""Get the appropriate API key based on sandbox mode.
+
+		Priority for sandbox mode:
+		1. sandbox_secret_key from DocType
+		2. sandbox_secret_key from site_config.json
+
+		Priority for live mode:
+		1. secret_key from DocType
+		"""
+		if self.is_sandbox_mode():
+			# Try DocType field first, then fall back to site config
+			sandbox_key = self.get_password(fieldname="sandbox_secret_key", raise_exception=False)
+			if sandbox_key:
+				return sandbox_key
+			# Fallback to site_config.json
+			return frappe.conf.get("sandbox_secret_key") or frappe.conf.get("mollie_sandbox_secret_key")
+		else:
+			return self.get_password(fieldname="secret_key", raise_exception=False)
+
+	def get_active_profile_id(self):
+		"""Get the appropriate profile ID based on sandbox mode.
+
+		Priority for sandbox mode:
+		1. sandbox_profile_id from DocType
+		2. sandbox_profile_id from site_config.json
+
+		Priority for live mode:
+		1. profile_id from DocType
+		"""
+		if self.is_sandbox_mode():
+			# Try DocType field first, then fall back to site config
+			if self.sandbox_profile_id:
+				return self.sandbox_profile_id
+			# Fallback to site_config.json
+			return frappe.conf.get("sandbox_profile_id") or frappe.conf.get("mollie_sandbox_profile_id")
+		else:
+			return self.profile_id
+
 	def get_payment_url(self, **kwargs):
 		return get_url(f"mollie_checkout?{urlencode(kwargs)}")
 
 	def get_mollie_client(self):
-		"""Create and return a new Mollie client instance with API key set."""
+		"""Create and return a new Mollie client instance with the appropriate API key."""
 		client = Client()
-		client.set_api_key(self.get_password(fieldname="secret_key", raise_exception=False))
+		api_key = self.get_api_key()
+		if not api_key:
+			mode = "sandbox" if self.is_sandbox_mode() else "live"
+			frappe.throw(_("Mollie {0} API key is not configured").format(mode))
+		client.set_api_key(api_key)
 		return client
 
 	def create_request(self, data):
@@ -94,8 +149,17 @@ class MollieSettings(Document):
 			self.integration_request = create_request_log(self.data, service_name="Mollie")
 			return self.create_charge_on_mollie()
 
-		except Exception:
-			frappe.log_error(frappe.get_traceback())
+		except MollieError as e:
+			log_payment_error("Mollie", e, {"method": "create_request", "data": self.data})
+			return {
+				"redirect_to": frappe.redirect_to_message(
+					_("Payment Error"),
+					_("Mollie payment failed: {0}").format(str(e)),
+				),
+				"status": 400,
+			}
+		except Exception as e:
+			log_payment_error("Mollie", e, {"method": "create_request", "data": self.data})
 			return {
 				"redirect_to": frappe.redirect_to_message(
 					_("Server Error"),
@@ -131,55 +195,63 @@ class MollieSettings(Document):
 
 			return {"paymentUrl": paymentUrl, "status": status}
 
-		except Exception:
-			frappe.log_error(frappe.get_traceback())
-			return {"paymentUrl": "Unavailable", "status": "Error"}
+		except MollieError as e:
+			log_payment_error("Mollie", e, {"method": "check_request", "payment_id": paymentID})
+			return {"paymentUrl": "Unavailable", "status": "Error", "error": str(e)}
+		except Exception as e:
+			log_payment_error("Mollie", e, {"method": "check_request", "payment_id": paymentID})
+			return {"paymentUrl": "Unavailable", "status": "Error", "error": str(e)}
 
 	def create_charge_on_mollie(self):
-		try:
-			data_details = {
-				"amount": self.data.amount,
-				"title": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
-				"description": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
-				"reference_doctype": self.data.reference_doctype,
-				"reference_docname": self.data.reference_docname,
-				"payer_email": frappe.session.user,
-				"payer_name": frappe.utils.get_fullname(frappe.session.user),
-				"order_id": self.data.reference_docname,
+		data_details = {
+			"amount": self.data.amount,
+			"title": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
+			"description": f"Payment for {self.data.reference_doctype} {self.data.reference_docname}",
+			"reference_doctype": self.data.reference_doctype,
+			"reference_docname": self.data.reference_docname,
+			"payer_email": frappe.session.user,
+			"payer_name": frappe.utils.get_fullname(frappe.session.user),
+			"order_id": self.data.reference_docname,
+			"currency": self.data.currency,
+			"redirect_to": self.data.get("redirect_to"),
+		}
+		redirect_url = self.get_payment_url(**data_details)
+		email = frappe.db.get_value(
+			self.data.reference_doctype, self.data.reference_docname, "email"
+		)
+		if email:
+			self.data.payer_email = email
+
+		charge_data = {
+			"amount": {
 				"currency": self.data.currency,
-				"redirect_to": self.data.get("redirect_to"),
-			}
-			redirect_url = self.get_payment_url(**data_details)
-			email = frappe.db.get_value(
-				self.data.reference_doctype, self.data.reference_docname, "email"
-			)
-			if email:
-				self.data.payer_email = email
+				"value": "{:.2f}".format(float(self.data.amount)),
+			},
+			"description": self.data.description,
+			"redirectUrl": redirect_url,
+		}
 
-			charge_data = {
-				"amount": {
-					"currency": self.data.currency,
-					"value": "{:.2f}".format(float(self.data.amount)),
-				},
-				"description": self.data.description,
-				"redirectUrl": redirect_url,
-			}
+		if (
+			self.data.payer_email
+			and self.data.payer_email != "Guest"
+			and frappe.utils.validate_email_address(self.data.payer_email)
+		):
+			charge_data["billingAddress"] = {"email": self.data.payer_email}
 
-			if (
-				self.data.payer_email
-				and self.data.payer_email != "Guest"
-				and frappe.utils.validate_email_address(self.data.payer_email)
-			):
-				charge_data["billingAddress"] = {"email": self.data.payer_email}
-
+		try:
 			charge = self.mollie_client.payments.create(charge_data)
-
 			frappe.db.set_value(
 				self.data.reference_doctype, self.data.reference_docname, "payment_id", charge.id
 			)
-
-		except Exception:
-			frappe.log_error(frappe.get_traceback())
+		except MollieError as e:
+			log_payment_error(
+				"Mollie", e, {"method": "create_charge_on_mollie", "charge_data": charge_data}
+			)
+			raise
+		except Exception as e:
+			log_payment_error(
+				"Mollie", e, {"method": "create_charge_on_mollie", "charge_data": charge_data}
+			)
 			raise
 
 		data2 = self.finalize_request()
@@ -200,8 +272,16 @@ class MollieSettings(Document):
 					custom_redirect_to = frappe.get_doc(
 						self.data.reference_doctype, self.data.reference_docname
 					).run_method("on_payment_authorized", self.flags.status_changed_to)
-				except Exception:
-					frappe.log_error(frappe.get_traceback())
+				except Exception as e:
+					log_payment_error(
+						"Mollie",
+						e,
+						{
+							"method": "finalize_request.on_payment_authorized",
+							"reference_doctype": self.data.reference_doctype,
+							"reference_docname": self.data.reference_docname,
+						},
+					)
 
 				if custom_redirect_to:
 					redirect_to = custom_redirect_to

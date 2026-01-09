@@ -5,7 +5,7 @@ import json
 
 import frappe
 from frappe import _
-from frappe.utils import cint, fmt_money
+from frappe.utils import fmt_money
 
 from payments.payment_gateways.doctype.mollie_settings.mollie_settings import (
 	get_gateway_controller,
@@ -42,7 +42,7 @@ def get_context(context):
 			context[key] = frappe.form_dict[key]
 
 		gateway_controller = get_gateway_controller(context.reference_doctype, context.reference_docname)
-		context.profile_id = get_api_key(context.reference_docname, gateway_controller)
+		context.profile_id = get_profile_id(context.reference_docname, gateway_controller)
 		context.image = get_header_image(context.reference_docname, gateway_controller)
 
 		context["amount"] = fmt_money(amount=context["amount"], currency=context["currency"])
@@ -58,18 +58,14 @@ def get_context(context):
 		
 
 
-def get_api_key(doc, gateway_controller):
-	profile_id = frappe.db.get_value("Mollie Settings", gateway_controller, "profile_id")
-	if cint(frappe.form_dict.get("use_sandbox")):
-		profile_id = frappe.conf.sandbox_profile_id
-
-	return profile_id
+def get_profile_id(doc, gateway_controller):
+	"""Get the appropriate Mollie profile ID (sandbox or live)."""
+	mollie_settings = frappe.get_doc("Mollie Settings", gateway_controller)
+	return mollie_settings.get_active_profile_id()
 
 
 def get_header_image(doc, gateway_controller):
-	header_image = frappe.db.get_value("Mollie Settings", gateway_controller, "header_img")
-
-	return header_image
+	return frappe.db.get_value("Mollie Settings", gateway_controller, "header_img")
 
 
 @frappe.whitelist(allow_guest=True)
@@ -105,7 +101,6 @@ def make_payment(data, reference_doctype, reference_docname):
 		paymentID = data["paymentID"]
 		status = "Open"
 		data["status"] = status
-		data["paymentUrl"] = data["paymentUrl"]
 	else:
 		status = status["status"]
 		data["status"] = status
