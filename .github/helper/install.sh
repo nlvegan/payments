@@ -16,7 +16,7 @@ frappebranch=${FRAPPE_BRANCH:-$githubbranch}
 erpnextbranch=${ERPNEXT_BRANCH:-$githubbranch}
 
 git clone "https://github.com/${frappeuser}/frappe" --branch "${frappebranch}" --depth 1
-bench init --skip-assets --frappe-path ~/frappe --python "$(which python)" frappe-bench
+bench init --skip-assets --frappe-path ~/frappe --frappe-branch "${frappebranch}" --python "$(which python)" frappe-bench
 
 mkdir ~/frappe-bench/sites/test_site
 cp -r "${GITHUB_WORKSPACE}/.github/helper/site_config.json" ~/frappe-bench/sites/test_site/
@@ -53,4 +53,16 @@ bench start &>> ~/frappe-bench/bench_start.log &
 CI=Yes bench build --app frappe &
 bench --site test_site reinstall --yes
 
+# Install ERPNext first (required for before_tests to create company)
+bench --site test_site install-app erpnext
 bench --verbose --site test_site install-app payments
+
+# Set up ERPNext test fixtures (creates company, accounts, etc.)
+# Required for E2E tests that need to create Sales Invoices
+echo ">>> Running before_tests to set up company..."
+bench --site test_site execute erpnext.setup.utils.before_tests
+echo ">>> before_tests completed"
+
+# Verify company was created
+echo ">>> Checking default company..."
+bench --site test_site execute "print('Default Company:', frappe.db.get_default('Company'))"
