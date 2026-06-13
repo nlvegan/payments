@@ -87,24 +87,25 @@ class PaymentSessionLog(Document):
 			commit=True,
 		)
 
-	def update_gateway_specific_state(self, data: dict, status: str) -> None:
-		"""Store gateway-specific state during data capture phase."""
+	def _set_initiation_state(self, payload, status: str) -> None:
+		"""Persist the initiation_response_payload (JSON-serialized) + status in one
+		committed write. Shared by update_gateway_specific_state and
+		set_initiation_payload, which only differ in the semantic name of `payload`.
+		"""
 		self.db_set(
 			{
-				"initiation_response_payload": frappe.as_json(data),
+				"initiation_response_payload": frappe.as_json(payload),
 				"status": status,
 			},
 			commit=True,
 		)
 
+	def update_gateway_specific_state(self, data: dict, status: str) -> None:
+		"""Store gateway-specific state during data capture phase."""
+		self._set_initiation_state(data, status)
+
 	def set_initiation_payload(self, initiation_payload: RemoteServerInitiationPayload, status: str) -> None:
-		self.db_set(
-			{
-				"initiation_response_payload": frappe.as_json(initiation_payload),
-				"status": status,
-			},
-			commit=True,
-		)
+		self._set_initiation_state(initiation_payload, status)
 
 	def set_processing_payload(self, processing_response: GatewayProcessingResponse, status: str) -> None:
 		self.db_set(
