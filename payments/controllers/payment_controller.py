@@ -497,6 +497,15 @@ class PaymentController(Document):
 				fallback_action=dict(href="/", label=_("Go to Homepage")),
 			)
 
+		def make_error_processed(error, message):
+			return Processed(
+				message=message,
+				action=get_compensatory_action(error),
+				status_changed_to=_("Server Error"),
+				indicator_color="red",
+				payload={},
+			)
+
 		try:
 			processed = self._process_response(psl, response, ref_doc)
 			if self.flags.status_changed_to in self.flowstates.declined:
@@ -512,37 +521,19 @@ class PaymentController(Document):
 		except PayloadIntegrityError:
 			error = psl.log_error("Response validation failure")
 			if not mute:
-				return Processed(
-					message=_("There's been an issue with your payment."),
-					action=get_compensatory_action(error),
-					status_changed_to=_("Server Error"),
-					indicator_color="red",
-					payload={},
-				)
+				return make_error_processed(error, _("There's been an issue with your payment."))
 
 		except PaymentControllerProcessingError as e:
 			error = psl.log_error(f"Processing error ({e.psltype})")
 			psl.set_processing_payload(response, "Error")
 			if not mute:
-				return Processed(
-					message=_error_value(error, e.psltype),
-					action=get_compensatory_action(error),
-					status_changed_to=_("Server Error"),
-					indicator_color="red",
-					payload={},
-				)
+				return make_error_processed(error, _error_value(error, e.psltype))
 
 		except RefDocHookProcessingError as e:
 			error = psl.log_error(f"Processing failure ({e.psltype} - refdoc hook)", e.__cause__)
 			psl.set_processing_payload(response, "Error - RefDoc")
 			if not mute:
-				return Processed(
-					message=_error_value(error, f"{e.psltype} (via ref doc hook)"),
-					action=get_compensatory_action(error),
-					status_changed_to=_("Server Error"),
-					indicator_color="red",
-					payload={},
-				)
+				return make_error_processed(error, _error_value(error, f"{e.psltype} (via ref doc hook)"))
 		else:
 			return processed
 		finally:
