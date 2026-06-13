@@ -455,40 +455,55 @@ class PaymentController(Document):
 				**ret,
 			)
 
-		# Check if ref_doc implements the hook method (optional for smoother adoption)
+		return self._invoke_ref_doc_hook(ref_doc, changed, ret, processed)
+
+	def _invoke_ref_doc_hook(
+		self, ref_doc: Document, changed: bool, ret: dict, processed: Processed
+	) -> Processed:
+		"""Invoke the optional ``on_payment_charge_processed`` hook on the ref doc.
+
+		The hook is optional (for smoother adoption); when present it may override
+		the default ``processed`` value built by ``_process_response``. Any failure
+		in user/server-script code is wrapped in ``RefDocHookProcessingError`` after
+		scrubbing the client-visible message log, so no internal details leak.
+
+		Returns the (possibly overridden) ``Processed``.
+		"""
 		hookmethod = "on_payment_charge_processed"
 		has_hook = hasattr(ref_doc, hookmethod) and callable(getattr(ref_doc, hookmethod, None))
 
-		if has_hook:
-			try:
-				ref_doc.flags.payment_session = frappe._dict(
-					changed=changed, state=self.state, flags=self.flags, flowstates=self.flowstates
-				)  # when run as server script: can only set flags
-				res = ref_doc.run_method(
-					hookmethod,
-					changed,
-					self.state,
-					self.flags,
-					self.flowstates,
-				)
-				# result from server script run
-				res = ref_doc.flags.payment_result or res
-				if res:
-					# type check the result value on user implementations
-					res["action"] = ActionAfterProcessed(**res.get("action", {})).__dict__
-					_res = _Processed(**res)
-					processed = Processed(**(ret | _res.__dict__))
-			except Exception as e:
-				# Ensure no details are leaked to the client
-				frappe.local.message_log = [
-					{
-						"message": _("Server Processing Failure!"),
-						"subtitle": _("(during RefDoc processing)"),
-						"body": str(e),
-						"indicator": "red",
-					}
-				]
-				raise RefDocHookProcessingError("RefDoc hook processing failed", "charge") from e
+		if not has_hook:
+			return processed
+
+		try:
+			ref_doc.flags.payment_session = frappe._dict(
+				changed=changed, state=self.state, flags=self.flags, flowstates=self.flowstates
+			)  # when run as server script: can only set flags
+			res = ref_doc.run_method(
+				hookmethod,
+				changed,
+				self.state,
+				self.flags,
+				self.flowstates,
+			)
+			# result from server script run
+			res = ref_doc.flags.payment_result or res
+			if res:
+				# type check the result value on user implementations
+				res["action"] = ActionAfterProcessed(**res.get("action", {})).__dict__
+				_res = _Processed(**res)
+				processed = Processed(**(ret | _res.__dict__))
+		except Exception as e:
+			# Ensure no details are leaked to the client
+			frappe.local.message_log = [
+				{
+					"message": _("Server Processing Failure!"),
+					"subtitle": _("(during RefDoc processing)"),
+					"body": str(e),
+					"indicator": "red",
+				}
+			]
+			raise RefDocHookProcessingError("RefDoc hook processing failed", "charge") from e
 
 		return processed
 
