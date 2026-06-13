@@ -143,9 +143,17 @@ class PaymentSessionLog(Document):
 
 	@staticmethod
 	def clear_old_logs(days=90):
+		# Clean ALL terminal-state logs older than the window, not just "Paid":
+		# Declined/Cancelled/Error/Error - RefDoc logs are equally done and would
+		# otherwise grow without bound. Reuse TERMINAL_STATES as the single source
+		# of truth for what counts as terminal.
+		# NOTE: the retention window (days) could be made site-configurable in a
+		# future change; intentionally left hardcoded here.
 		table = frappe.qb.DocType("Payment Session Log")
+		terminal_states = list(PaymentSessionLog.TERMINAL_STATES)
 		frappe.db.delete(
-			table, filters=(table.modified < (Now() - Interval(days=days))) & (table.status == "Paid")
+			table,
+			filters=(table.modified < (Now() - Interval(days=days))) & (table.status.isin(terminal_states)),
 		)
 
 

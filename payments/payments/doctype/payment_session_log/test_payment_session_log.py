@@ -284,3 +284,37 @@ class TestUpdateTxDataValidation(IntegrationTestCase):
 		psl.reload()
 		state = psl.load_state()
 		self.assertEqual(state.tx_data.amount, 25.00)
+
+
+class TestClearOldLogs(IntegrationTestCase):
+	"""clear_old_logs() must purge ALL terminal-state logs past the retention
+	window, not just 'Paid' ones (else failed/errored logs grow unbounded)."""
+
+	def _create_terminal_log(self, status, *, old):
+		"""Create a terminal-status PSL; if old, backdate its modified column
+		past the 90-day retention window via a direct, unmodified-tracking write."""
+		psl = create_log(tx_data=_make_tx_data(), status=status)
+		if old:
+			# Bypass Frappe's modified-stamping by writing the column directly.
+			frappe.db.set_value(
+				"Payment Session Log",
+				psl.name,
+				"modified",
+				"2000-01-01 00:00:00",
+				update_modified=False,
+			)
+		return psl.name
+
+	def test_clears_old_terminal_logs_keeps_recent(self):
+		old_declined = self._create_terminal_log("Declined", old=True)
+		old_error = self._create_terminal_log("Error", old=True)
+		old_paid = self._create_terminal_log("Paid", old=True)
+		recent_declined = self._create_terminal_log("Declined", old=False)
+		frappe.db.commit()
+
+		PaymentSessionLog.clear_old_logs(days=90)
+
+		self.assertFalse(frappe.db.exists("Payment Session Log", old_declined))
+		self.assertFalse(frappe.db.exists("Payment Session Log", old_error))
+		self.assertFalse(frappe.db.exists("Payment Session Log", old_paid))
+		self.assertTrue(frappe.db.exists("Payment Session Log", recent_declined))
