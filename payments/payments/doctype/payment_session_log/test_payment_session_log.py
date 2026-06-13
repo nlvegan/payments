@@ -286,6 +286,78 @@ class TestUpdateTxDataValidation(IntegrationTestCase):
 		self.assertEqual(state.tx_data.amount, 25.00)
 
 
+class TestCreateLogPayerPIIMinimization(IntegrationTestCase):
+	"""M2: create_log() must strip non-essential PII from payer_contact /
+	payer_address (full as_dict() output) down to the documented allowlists
+	before persisting them in the PSL."""
+
+	def test_strips_non_allowlisted_payer_keys(self):
+		tx_data = TxData(
+			amount=25.00,
+			currency="EUR",
+			reference_doctype="User",
+			reference_docname="Administrator",
+			payer_contact={
+				"full_name": "Jane Doe",
+				"email_id": "jane@example.com",
+				"phone": "123",
+				"mobile_no": "456",
+				# noise that must NOT be persisted
+				"owner": "x@internal",
+				"modified_by": "admin@internal",
+				"creation": "2020-01-01",
+				"secret_note": "y",
+			},
+			payer_address={
+				"address_line1": "1 Main St",
+				"city": "Town",
+				"country": "NL",
+				"owner": "x@internal",
+				"custom_internal": "z",
+			},
+			loyalty_points=None,
+			discount_amount=None,
+		)
+		psl = create_log(tx_data=tx_data)
+		psl.reload()
+		stored = json.loads(psl.tx_data)
+
+		contact = stored["payer_contact"]
+		# allowlisted fields survive
+		self.assertEqual(contact.get("full_name"), "Jane Doe")
+		self.assertEqual(contact.get("email_id"), "jane@example.com")
+		self.assertEqual(contact.get("phone"), "123")
+		self.assertEqual(contact.get("mobile_no"), "456")
+		# everything else is gone
+		for stripped in ("owner", "modified_by", "creation", "secret_note"):
+			self.assertNotIn(stripped, contact)
+
+		address = stored["payer_address"]
+		self.assertEqual(address.get("address_line1"), "1 Main St")
+		self.assertEqual(address.get("city"), "Town")
+		self.assertEqual(address.get("country"), "NL")
+		for stripped in ("owner", "custom_internal"):
+			self.assertNotIn(stripped, address)
+
+	def test_tolerates_empty_and_partial_payer_dicts(self):
+		"""Missing keys / empty dicts must not raise."""
+		tx_data = TxData(
+			amount=10.00,
+			currency="EUR",
+			reference_doctype="User",
+			reference_docname="Administrator",
+			payer_contact={},
+			payer_address={"city": "Town"},
+			loyalty_points=None,
+			discount_amount=None,
+		)
+		psl = create_log(tx_data=tx_data)
+		psl.reload()
+		stored = json.loads(psl.tx_data)
+		self.assertEqual(stored["payer_contact"], {})
+		self.assertEqual(stored["payer_address"], {"city": "Town"})
+
+
 class TestClearOldLogs(IntegrationTestCase):
 	"""clear_old_logs() must purge ALL terminal-state logs past the retention
 	window, not just 'Paid' ones (else failed/errored logs grow unbounded)."""

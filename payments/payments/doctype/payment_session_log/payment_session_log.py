@@ -238,6 +238,39 @@ def select_button(pslName: str | None = None, buttonName: str | None = None) -> 
 	return {"reload": True}
 
 
+# Data minimization (M2): TxData.payer_contact / payer_address arrive as full
+# document dicts (contact.as_dict() / address.as_dict()), which carry PII and
+# bookkeeping fields we neither need nor want to persist for the PSL retention
+# window or expose to guest-rendered templates (owner, modified_by, timestamps,
+# custom fields, etc.). Project them down to the minimal fields actually used
+# for the payment + display. Anything not on these allowlists is stripped.
+_PAYER_CONTACT_ALLOWLIST = frozenset({"full_name", "email_id", "phone", "mobile_no"})
+_PAYER_ADDRESS_ALLOWLIST = frozenset(
+	{"address_line1", "address_line2", "city", "state", "country", "pincode"}
+)
+
+
+def _project_allowed(value, allowlist: frozenset) -> dict:
+	"""Return only the allowlisted keys of a dict; defensive against non-dicts
+	and missing keys (tolerates partially-populated payer documents)."""
+	if not isinstance(value, dict):
+		return value
+	return {k: value[k] for k in allowlist if k in value}
+
+
+def _minimize_payer_pii(tx_data_dict: dict) -> dict:
+	"""Strip non-essential PII from payer_contact/payer_address before persisting."""
+	if "payer_contact" in tx_data_dict:
+		tx_data_dict["payer_contact"] = _project_allowed(
+			tx_data_dict["payer_contact"], _PAYER_CONTACT_ALLOWLIST
+		)
+	if "payer_address" in tx_data_dict:
+		tx_data_dict["payer_address"] = _project_allowed(
+			tx_data_dict["payer_address"], _PAYER_ADDRESS_ALLOWLIST
+		)
+	return tx_data_dict
+
+
 def create_log(
 	tx_data: TxData,
 	controller: "PaymentController" = None,
@@ -246,6 +279,7 @@ def create_log(
 	log = frappe.new_doc("Payment Session Log")
 	# TxData is a dataclass — convert to dict for JSON serialization
 	tx_data_dict = dataclasses.asdict(tx_data) if dataclasses.is_dataclass(tx_data) else tx_data
+	tx_data_dict = _minimize_payer_pii(tx_data_dict)
 	log.tx_data = frappe.as_json(tx_data_dict)
 	log.status = status
 	if controller:
