@@ -140,6 +140,12 @@ class PaymentController(Document):
 		# instantiation. __init_subclass__ runs for subclasses only, so the
 		# PaymentController base class itself — which legitimately doesn't declare
 		# them — is never checked here.
+		# NOTE: because this fires at class-definition time, an *abstract
+		# intermediate* subclass (one that deliberately defers flowstates/
+		# frontend_defaults to its own concrete subclasses) would raise here at
+		# import. There are none today (gateways subclass PaymentController
+		# directly). If one is introduced, guard this check (e.g. skip when the
+		# class is marked abstract) rather than declaring placeholder attrs.
 		super().__init_subclass__(**kwargs)
 		if not (hasattr(cls, "flowstates") and isinstance(cls.flowstates, SessionStates)):
 			raise TypeError(
