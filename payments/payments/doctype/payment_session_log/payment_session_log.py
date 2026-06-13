@@ -71,12 +71,17 @@ class PaymentSessionLog(Document):
 		"""Get the indicator color for the current status."""
 		return self.TERMINAL_STATES.get(self.status, "gray")
 
-	def update_tx_data(self, tx_data: TxData, status: str) -> None:
-		data = json.loads(self.tx_data)
-		data.update(tx_data)
+	def update_tx_data(self, tx_data: dict, status: str) -> None:
+		# tx_data is a dict of updates (the controller passes
+		# _filter_tx_data_updates(...) output). Reconstruct a TxData from the
+		# merged result before persisting so a type-mismatched update raises
+		# TypeError here instead of silently corrupting the stored JSON and
+		# blowing up later in load_state() (TxData(**json.loads(...))).
+		merged = {**json.loads(self.tx_data), **tx_data}
+		validated = TxData(**merged)
 		self.db_set(
 			{
-				"tx_data": frappe.as_json(data),
+				"tx_data": frappe.as_json(dataclasses.asdict(validated)),
 				"status": status,
 			},
 			commit=True,

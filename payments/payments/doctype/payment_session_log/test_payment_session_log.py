@@ -258,3 +258,29 @@ class TestGetControllerFreshness(IntegrationTestCase):
 		first.state.leaked = "should-not-persist"
 		second = psl.get_controller()
 		self.assertEqual(second.state, {})
+
+
+class TestUpdateTxDataValidation(IntegrationTestCase):
+	"""update_tx_data() must validate the merged result against TxData so bad
+	updates fail fast instead of silently corrupting the stored JSON."""
+
+	def test_well_formed_update_round_trips(self):
+		"""A valid update merges cleanly and load_state() reconstructs TxData."""
+		psl = create_log(tx_data=_make_tx_data())
+		psl.update_tx_data({"amount": 99.5}, "Started")
+		psl.reload()
+		self.assertEqual(psl.status, "Started")
+		state = psl.load_state()
+		self.assertEqual(state.tx_data.amount, 99.5)
+		self.assertEqual(state.tx_data.currency, "EUR")
+
+	def test_malformed_update_raises_typeerror(self):
+		"""An update introducing an unknown field must raise TypeError at update
+		time, not persist silently and break the next load_state()."""
+		psl = create_log(tx_data=_make_tx_data())
+		with self.assertRaises(TypeError):
+			psl.update_tx_data({"not_a_real_field": "x"}, "Started")
+		# Nothing corrupt was persisted: original state still loads.
+		psl.reload()
+		state = psl.load_state()
+		self.assertEqual(state.tx_data.amount, 25.00)
