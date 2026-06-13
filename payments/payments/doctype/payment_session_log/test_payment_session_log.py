@@ -10,8 +10,23 @@ from frappe.tests import IntegrationTestCase
 
 from payments.payments.doctype.payment_session_log.payment_session_log import (
 	PaymentSessionLog,
+	create_log,
 	select_button,
 )
+from payments.types import TxData
+
+
+def _make_tx_data() -> TxData:
+	return TxData(
+		amount=25.00,
+		currency="EUR",
+		reference_doctype="User",
+		reference_docname="Administrator",
+		payer_contact={},
+		payer_address={},
+		loyalty_points=None,
+		discount_amount=None,
+	)
 
 
 class TestPaymentSessionLogTerminalStates(unittest.TestCase):
@@ -174,3 +189,31 @@ class TestSelectButtonAuthorization(IntegrationTestCase):
 		self.assertIsNotNone(result)
 		psl.reload()
 		self.assertEqual(psl.button, "_Test PSL Button")
+
+
+class TestPaymentSessionLogStatusDefault(IntegrationTestCase):
+	"""The schema default for `status` must match the code's initial state."""
+
+	def test_create_log_starts_in_created(self):
+		"""create_log() inserts a PSL in the 'Created' state."""
+		psl = create_log(tx_data=_make_tx_data())
+		self.assertEqual(psl.status, "Created")
+
+	def test_bare_insert_defaults_to_created(self):
+		"""A PSL inserted without an explicit status falls back to the schema
+		default, which must be 'Created' (a state the state machine knows),
+		not the unrecognized 'Queued'."""
+		psl = frappe.get_doc(
+			{
+				"doctype": "Payment Session Log",
+				"tx_data": json.dumps({"amount": 100, "currency": "USD"}),
+			}
+		)
+		psl.insert(ignore_permissions=True)
+		self.assertEqual(psl.status, "Created")
+
+	def test_created_is_a_recognized_non_terminal_state(self):
+		"""'Created' must be a valid, non-terminal state the machine accepts."""
+		psl = PaymentSessionLog.__new__(PaymentSessionLog)
+		psl.status = "Created"
+		self.assertFalse(psl.is_terminal())
