@@ -1,6 +1,7 @@
 import json
 from dataclasses import asdict, dataclass
 from enum import Enum
+from typing import TypeAlias
 
 
 class SessionType(str, Enum):
@@ -165,27 +166,30 @@ class Processed(_Processed):
 
 
 # for nicer DX using an LSP
+#
+# These are annotation-only markers (never instantiated or isinstance-checked at
+# runtime), so they are plain TypeAliases for `str` rather than str subclasses.
+# This avoids the surprising identity of a str subclass (e.g. type(x) is not str)
+# while keeping the names importable and meaningful in signatures.
 
+PSLName: TypeAlias = str
+"""The name of the primary local reference to identify an ongoing payment gateway flow.
 
-class PSLName(str):
-	"""The name of the primary local reference to identify an ongoing payment gateway flow.
+Interface: Payment Gateway Controller -> Ref Doc -> Payment Gateway Controller
+           Payment Gateway Controller -> Remote Server -> Payment Gateway Controller
+           Payment Gateway Controller -> Calling Buisness Flow -> Payment Gateway Controller
 
-	Interface: Payment Gateway Controller -> Ref Doc -> Payment Gateway Controller
-	           Payment Gateway Controller -> Remote Server -> Payment Gateway Controller
-	           Payment Gateway Controller -> Calling Buisness Flow -> Payment Gateway Controller
+It is first returned by a call to initiate and should be stored on
+the Ref Doc for later reference.
+"""
 
-	It is first returned by a call to initiate and should be stored on
-	the Ref Doc for later reference.
-	"""
+PaymentUrl: TypeAlias = str
+"""The payment url in case the gateway implements it.
 
+Interface: Payment Gateway Controller -> Ref Doc
 
-class PaymentUrl(str):
-	"""The payment url in case the gateway implements it.
-
-	Interface: Payment Gateway Controller -> Ref Doc
-
-	It is rendered from the integration log reference and the URL of the current site.
-	"""
+It is rendered from the integration log reference and the URL of the current site.
+"""
 
 
 @dataclass
