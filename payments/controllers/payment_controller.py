@@ -277,8 +277,15 @@ class PaymentController(Document):
 			_redirect_on_initiation_error(psl, error, include_psl=True)
 
 		# ... yet others do ...
-		except HTTPError:
-			data = frappe.flags.integration_request.json()
+		except HTTPError as err:
+			# v2 sets frappe.flags.integration_request_doc (the PSL), never the v1
+			# frappe.flags.integration_request, so reading the latter raised
+			# AttributeError and masked the original HTTPError. Read the response
+			# body off the exception itself, with a safe fallback.
+			try:
+				data = err.response.json() if err.response is not None else {}
+			except ValueError:
+				data = {"error": str(err)}
 			psl.set_initiation_payload(data, "Error")
 			error = frappe.get_last_doc("Error Log")
 			_redirect_on_initiation_error(psl, error, include_psl=True)

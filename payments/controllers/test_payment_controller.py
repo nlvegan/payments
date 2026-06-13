@@ -261,6 +261,27 @@ class TestPaymentControllerLifecycle(IntegrationTestCase):
 				PaymentController.proceed(psl_name)
 		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Error")
 
+	def test_proceed_redirects_on_http_error(self):
+		"""On an HTTPError during initiation, proceed must read the response body
+		off the exception (v2 never sets frappe.flags.integration_request) and
+		redirect — not raise AttributeError that masks the original error."""
+		from requests.exceptions import HTTPError
+
+		tx_data = _make_tx_data()
+		_controller, psl_name = PaymentController.initiate(tx_data, self.gateway_name)
+
+		class _FakeResponse:
+			def json(self):
+				return {"gateway_error": "boom"}
+
+		http_error = HTTPError("502 Bad Gateway")
+		http_error.response = _FakeResponse()
+
+		with patch.object(PaymentDemoSettings, "_initiate_charge", side_effect=http_error):
+			with self.assertRaises(frappe.Redirect):
+				PaymentController.proceed(psl_name)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Error")
+
 	# -- pre_data_capture_hook --
 
 	def test_pre_data_capture_hook_stores_state(self):
