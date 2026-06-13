@@ -217,3 +217,44 @@ class TestPaymentSessionLogStatusDefault(IntegrationTestCase):
 		psl = PaymentSessionLog.__new__(PaymentSessionLog)
 		psl.status = "Created"
 		self.assertFalse(psl.is_terminal())
+
+
+class TestGetControllerFreshness(IntegrationTestCase):
+	"""get_controller() must return a fresh, uncached controller instance so
+	that PaymentController.state never bleeds between resolutions."""
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		if not frappe.db.exists("Payment Demo Settings", "Payment Demo Settings"):
+			demo = frappe.get_doc({"doctype": "Payment Demo Settings", "gateway_name": "Demo"})
+			demo.flags.ignore_mandatory = True
+			demo.insert(ignore_permissions=True)
+		frappe.db.commit()
+
+	def _create_psl(self):
+		from payments.types import GatewayRef
+
+		psl = create_log(tx_data=_make_tx_data())
+		psl.db_set(
+			"gateway",
+			GatewayRef("Payment Demo Settings", "Payment Demo Settings").to_json(),
+		)
+		return psl
+
+	def test_get_controller_returns_distinct_instances(self):
+		"""Two resolutions must not share the same (cached) object."""
+		psl = self._create_psl()
+		first = psl.get_controller()
+		second = psl.get_controller()
+		self.assertIsNot(first, second)
+
+	def test_get_controller_state_is_fresh(self):
+		"""A controller resolved from a fresh PSL load starts with empty state,
+		and mutating one instance's state does not leak into the next."""
+		psl = self._create_psl()
+		first = psl.get_controller()
+		self.assertEqual(first.state, {})
+		first.state.leaked = "should-not-persist"
+		second = psl.get_controller()
+		self.assertEqual(second.state, {})

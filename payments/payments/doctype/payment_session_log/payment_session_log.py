@@ -124,7 +124,11 @@ class PaymentSessionLog(Document):
 			self.log_error("No gateway selected yet")
 			frappe.throw(_("No gateway selected for this payment session"))
 		ref = GatewayRef.from_json(self.gateway)
-		return frappe.get_cached_doc(ref.gateway_settings, ref.gateway_controller)
+		# Use get_doc (NOT get_cached_doc) so each resolution yields a fresh
+		# controller instance with a fresh `self.state`. A cached controller
+		# reused within one request (e.g. a webhook processing several events
+		# for the same gateway) would otherwise carry stale state between calls.
+		return frappe.get_doc(ref.gateway_settings, ref.gateway_controller)
 
 	def get_button(self) -> "PaymentButton":
 		if not self.button:
