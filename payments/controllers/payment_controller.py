@@ -469,13 +469,19 @@ class PaymentController(Document):
 		psl: PaymentSessionLog = frappe.get_doc("Payment Session Log", psl_name)
 		self: PaymentController = psl.get_controller()
 
-		# Guard against concurrent processing (e.g. webhook + client confirm race)
-		psl.lock(timeout=5)
-		psl.reload()
-
-		# After acquiring the lock, check if another process already handled this
-		if psl.is_terminal():
-			psl.unlock()
+		# Guard against concurrent processing (e.g. webhook + client confirm race).
+		# Acquire the lock *outside* the try/finally below so contention is handled
+		# explicitly: psl.lock(timeout=5) raises frappe.DocumentLockedError (a
+		# ValidationError subclass) which the outer handler does NOT catch. On the
+		# muted server-to-server (webhook) path there is no error surface, so an
+		# escaping exception would 500 and make the gateway retry. Instead, treat
+		# contention as "someone else is already handling this" and report the PSL's
+		# current state.
+		try:
+			psl.lock(timeout=5)
+		except frappe.DocumentLockedError:
+			# Another process is already handling this PSL; report its current state.
+			psl.reload()
 			return Processed(
 				message=_(psl.status),
 				action=dict(href="/", label=_("Go to Homepage")),
@@ -484,55 +490,68 @@ class PaymentController(Document):
 				payload={},
 			)
 
-		self.state = psl.load_state()
-		self.state.response = response
+		try:
+			psl.reload()
 
-		ref_doc = frappe.get_doc(
-			self.state.tx_data.reference_doctype,
-			self.state.tx_data.reference_docname,
-		)
+			# After acquiring the lock, check if another process already handled this
+			if psl.is_terminal():
+				return Processed(
+					message=_(psl.status),
+					action=dict(href="/", label=_("Go to Homepage")),
+					status_changed_to=psl.status,
+					indicator_color=psl.get_indicator_color(),
+					payload={},
+				)
 
-		mute = self._is_server_to_server()
+			self.state = psl.load_state()
+			self.state.response = response
 
-		def make_error_processed(error, message):
-			return Processed(
-				message=message,
-				action=self._build_compensatory_action(psl, error),
-				status_changed_to=_("Server Error"),
-				indicator_color="red",
-				payload={},
+			ref_doc = frappe.get_doc(
+				self.state.tx_data.reference_doctype,
+				self.state.tx_data.reference_docname,
 			)
 
-		try:
-			processed = self._process_response(psl, ref_doc)
-			if self.flags.status_changed_to in self.flowstates.declined:
-				try:
-					msg = self._render_failure_message()
-					ref_doc.flags.payment_failure_message = msg
-					ref_doc.run_method("on_payment_failed", msg)
-				except Exception:
-					# Ensure no details are leaked to the client
-					frappe.local.message_log = []
-					psl.log_error("Setting failure message on ref doc failed")
+			mute = self._is_server_to_server()
 
-		except PayloadIntegrityError:
-			error = psl.log_error("Response validation failure")
-			if not mute:
-				return make_error_processed(error, _("There's been an issue with your payment."))
+			def make_error_processed(error, message):
+				return Processed(
+					message=message,
+					action=self._build_compensatory_action(psl, error),
+					status_changed_to=_("Server Error"),
+					indicator_color="red",
+					payload={},
+				)
 
-		except PaymentControllerProcessingError as e:
-			error = psl.log_error(f"Processing error ({e.psltype})")
-			psl.set_processing_payload(response, "Error")
-			if not mute:
-				return make_error_processed(error, _error_value(error, e.psltype))
+			try:
+				processed = self._process_response(psl, ref_doc)
+				if self.flags.status_changed_to in self.flowstates.declined:
+					try:
+						msg = self._render_failure_message()
+						ref_doc.flags.payment_failure_message = msg
+						ref_doc.run_method("on_payment_failed", msg)
+					except Exception:
+						# Ensure no details are leaked to the client
+						frappe.local.message_log = []
+						psl.log_error("Setting failure message on ref doc failed")
 
-		except RefDocHookProcessingError as e:
-			error = psl.log_error(f"Processing failure ({e.psltype} - refdoc hook)", e.__cause__)
-			psl.set_processing_payload(response, "Error - RefDoc")
-			if not mute:
-				return make_error_processed(error, _error_value(error, f"{e.psltype} (via ref doc hook)"))
-		else:
-			return processed
+			except PayloadIntegrityError:
+				error = psl.log_error("Response validation failure")
+				if not mute:
+					return make_error_processed(error, _("There's been an issue with your payment."))
+
+			except PaymentControllerProcessingError as e:
+				error = psl.log_error(f"Processing error ({e.psltype})")
+				psl.set_processing_payload(response, "Error")
+				if not mute:
+					return make_error_processed(error, _error_value(error, e.psltype))
+
+			except RefDocHookProcessingError as e:
+				error = psl.log_error(f"Processing failure ({e.psltype} - refdoc hook)", e.__cause__)
+				psl.set_processing_payload(response, "Error - RefDoc")
+				if not mute:
+					return make_error_processed(error, _error_value(error, f"{e.psltype} (via ref doc hook)"))
+			else:
+				return processed
 		finally:
 			psl.unlock()
 

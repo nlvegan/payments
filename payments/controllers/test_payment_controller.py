@@ -214,6 +214,22 @@ class TestPaymentControllerLifecycle(IntegrationTestCase):
 		self.assertEqual(result.payload, {})
 		self.assertIsInstance(result.action, dict)
 
+	# -- process_response: lock contention --
+
+	def test_process_response_lock_contention_returns_state(self):
+		"""If another process holds the PSL lock, process_response must report the
+		current PSL state instead of letting DocumentLockedError escape (which would
+		500 the muted webhook path and trigger gateway retries)."""
+		tx_data = _make_tx_data()
+		_controller, psl_name = PaymentController.initiate(tx_data, self.gateway_name)
+		PaymentController.proceed(psl_name)
+		response = GatewayProcessingResponse(hash=None, message=None, payload={"status": "succeeded"})
+		with patch.object(PaymentSessionLog, "lock", side_effect=frappe.DocumentLockedError("locked")):
+			result = PaymentController.process_response(psl_name, response)
+		# Must return a Processed, not raise
+		self.assertEqual(result.status_changed_to, "Initiated")
+		self.assertIsInstance(result.action, dict)
+
 	# -- proceed: error paths --
 
 	def test_proceed_redirects_on_initiation_failure(self):
