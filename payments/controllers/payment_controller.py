@@ -297,6 +297,18 @@ class PaymentController(Document):
 			error = psl.log_error(title="Unknown Initialization Failure")
 			_redirect_on_initiation_error(psl, error)
 
+	def get_frontend_safe_context(self) -> dict:
+		"""Fields safe to expose to the guest /pay templates. Override per gateway
+		to expose ONLY non-secret values (e.g. a publishable key). Default: none.
+
+		Security: the full gateway settings document holds API secrets (secret_key,
+		webhook secrets, tokens). It must NEVER be handed to templates whose rendered
+		output is injected into the public /pay page — a single `{{ doc.secret_key }}`
+		in any gateway template would leak credentials to every visitor. Callers build
+		the template context from this projection instead of the raw doc.
+		"""
+		return {}
+
 	def _get_support_email(self):
 		"""Look up the support email for the reference document, falling back to default incoming."""
 		incoming = get_document_email(

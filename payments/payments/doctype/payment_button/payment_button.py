@@ -41,10 +41,24 @@ class PaymentButton(Document):
 	#  - implement them for your controller
 	#  - need to be fully rendered with
 	# ---------------------------------------
+	def _frontend_safe_doc(self) -> "frappe._dict":
+		"""Frontend-safe projection of the gateway settings doc for templates.
+
+		Security (H1): the raw gateway settings document holds API secrets
+		(secret_key, webhook secrets, tokens). Since these templates are rendered
+		into the guest /pay page, passing the raw doc would let any template leak
+		credentials to every visitor. We expose ONLY the explicit, non-secret
+		fields the controller whitelists via get_frontend_safe_context(); existing
+		templates referencing `doc.<field>` keep working for whitelisted fields,
+		while secrets are simply absent.
+		"""
+		controller = frappe.get_cached_doc(self.gateway_settings, self.gateway_controller)
+		return frappe._dict(controller.get_frontend_safe_context())
+
 	def get_widget_assets(self, payload: RemoteServerInitiationPayload) -> (Css, Js, Wrapper):
 		"""Get the fully rendered frontend assets for this button."""
 		context = {
-			"doc": frappe.get_cached_doc(self.gateway_settings, self.gateway_controller),
+			"doc": self._frontend_safe_doc(),
 			"payload": payload,
 		}
 		css = frappe.render_template(self.gateway_css, context)
@@ -58,7 +72,7 @@ class PaymentButton(Document):
 		The rendering context is updated with `state`.
 		"""
 		context = {
-			"doc": frappe.get_cached_doc(self.gateway_settings, self.gateway_controller),
+			"doc": self._frontend_safe_doc(),
 			"extra": frappe._dict(json.loads(self.extra_payload)),
 		}
 		context.update(state)
