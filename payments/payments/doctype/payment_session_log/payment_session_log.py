@@ -157,6 +157,17 @@ class PaymentSessionLog(Document):
 		)
 
 
+def _error_ref(error_log) -> str:
+	"""Short, opaque correlation code for a guest-facing message.
+
+	str(error_log) is the Error Log docname, which embeds an internal
+	timestamp/naming scheme. Expose only the trailing 8 chars so support can
+	still correlate against the full server-side Error Log without leaking the
+	internal naming/timestamp to the guest. (M4)
+	"""
+	return str(error_log)[-8:]
+
+
 @frappe.whitelist(allow_guest=True)
 def select_button(pslName: str | None = None, buttonName: str | None = None) -> str:
 	"""Select a payment button for a payment session.
@@ -170,8 +181,10 @@ def select_button(pslName: str | None = None, buttonName: str | None = None) -> 
 		psl = frappe.get_doc("Payment Session Log", pslName)
 	except Exception:
 		e = frappe.log_error("Payment Session Log not found", reference_doctype="Payment Session Log")
-		# Ensure no more details are leaked than the error log reference
-		frappe.local.message_log = [_("Server Failure!<br>{}").format(e)]
+		# Return an opaque correlation code, not the Error Log docname: the name
+		# embeds internal timestamp/naming. Support can still correlate via the
+		# trailing chars stored in the (full) server-side Error Log. (M4)
+		frappe.local.message_log = [_("Server Failure! Reference: {0}").format(_error_ref(e))]
 		return
 
 	# Validate PSL is in a state where button selection is allowed

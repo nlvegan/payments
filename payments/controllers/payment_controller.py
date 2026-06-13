@@ -44,22 +44,35 @@ if TYPE_CHECKING:
 	from payments.payments.doctype.payment_gateway.payment_gateway import PaymentGateway
 
 
+def _error_ref(error_log) -> str:
+	"""Short, opaque correlation code for a guest-facing message.
+
+	str(error_log) is the Error Log docname, which embeds an internal
+	timestamp/naming scheme. Expose only the trailing 8 chars so support can
+	still correlate against the full server-side Error Log without leaking the
+	internal naming/timestamp to the guest. (M4)
+	"""
+	return str(error_log)[-8:]
+
+
 def _error_value(error, flow):
 	return _(
 		"Our server had a problem processing your {0}. Please contact customer support mentioning: {1}"
-	).format(flow, error)
+	).format(flow, _error_ref(error))
 
 
 def _redirect_on_initiation_error(psl, error, *, include_psl: bool = False) -> NoReturn:
 	"""Redirect the user to a generic payment-gateway error message and raise.
 
 	``psl`` is only interpolated into the message when ``include_psl`` is True.
-	Always raises ``frappe.Redirect`` — callers never resume after this.
+	The Error Log reference is shortened to an opaque code (the PSL name is
+	already known to the user via the /pay URL, so only the Error Log ref needs
+	hardening). Always raises ``frappe.Redirect`` — callers never resume.
 	"""
 	if include_psl:
-		body = _("Please contact customer care mentioning: {0} and {1}").format(psl, error)
+		body = _("Please contact customer care mentioning: {0} and {1}").format(psl, _error_ref(error))
 	else:
-		body = _("Please contact customer care mentioning: {0}").format(error)
+		body = _("Please contact customer care mentioning: {0}").format(_error_ref(error))
 	frappe.redirect_to_message(
 		_("Payment Gateway Error"),
 		body,

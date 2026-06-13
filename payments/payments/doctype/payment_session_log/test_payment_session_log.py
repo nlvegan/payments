@@ -10,6 +10,7 @@ from frappe.tests import IntegrationTestCase
 
 from payments.payments.doctype.payment_session_log.payment_session_log import (
 	PaymentSessionLog,
+	_error_ref,
 	create_log,
 	select_button,
 )
@@ -66,6 +67,23 @@ class TestPaymentSessionLogTerminalStates(unittest.TestCase):
 		psl = PaymentSessionLog.__new__(PaymentSessionLog)
 		psl.status = "SomeUnknownStatus"
 		self.assertEqual(psl.get_indicator_color(), "gray")
+
+
+class TestErrorRefShortening(unittest.TestCase):
+	"""M4: guest-facing failure messages must reference a short opaque code,
+	not the full Error Log docname (which embeds internal timestamp/naming)."""
+
+	def test_error_ref_is_short_opaque_code(self):
+		# Realistic Error Log docname embeds a timestamp-ish hash.
+		full_name = "8f3c9a1b2e4d5f60a7b8c9d0"
+		ref = _error_ref(full_name)
+		self.assertEqual(ref, full_name[-8:])
+		self.assertEqual(len(ref), 8)
+		self.assertNotEqual(ref, full_name)
+		# The full internal name is NOT contained in the guest-facing message.
+		msg = f"Server Failure! Reference: {ref}"
+		self.assertNotIn(full_name, msg)
+		self.assertIn(ref, msg)
 
 
 class TestSelectButtonAuthorization(IntegrationTestCase):
