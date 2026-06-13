@@ -72,8 +72,6 @@ def _redirect_on_initiation_error(psl, error, *, include_psl: bool = False) -> N
 class PaymentController(Document):
 	"""This controller implements the public API of payment gateway controllers."""
 
-	from typing import TYPE_CHECKING
-
 	if TYPE_CHECKING:
 		frontend_defaults: FrontendDefaults
 		flowstates: SessionStates
@@ -342,9 +340,7 @@ class PaymentController(Document):
 		),
 	}
 
-	def _process_response(
-		self, psl: PaymentSessionLog, response: GatewayProcessingResponse, ref_doc: Document
-	) -> Processed:
+	def _process_response(self, psl: PaymentSessionLog, ref_doc: Document) -> Processed:
 		self._validate_response()
 
 		processed = None
@@ -370,7 +366,7 @@ class PaymentController(Document):
 
 		ret = {
 			"status_changed_to": self.flags.status_changed_to,
-			"payload": response.payload,
+			"payload": self.state.response.payload,
 		}
 
 		changed = False
@@ -380,7 +376,7 @@ class PaymentController(Document):
 			if self.flags.status_changed_to in getattr(self.flowstates, category):
 				changed = psl_status != psl.status
 				psl.db_set("decline_reason", None)
-				psl.set_processing_payload(response, psl_status)  # commits
+				psl.set_processing_payload(self.state.response, psl_status)  # commits
 				ret["indicator_color"] = color
 				processed = processed or Processed(
 					message=_(msg_template).format("charge".title()),
@@ -398,7 +394,7 @@ class PaymentController(Document):
 					"button": None,  # reset the button for another chance
 				}
 			)
-			psl.set_processing_payload(response, "Declined")  # commits
+			psl.set_processing_payload(self.state.response, "Declined")  # commits
 			ret["indicator_color"] = "red"
 
 			action = self._build_support_action(
@@ -508,7 +504,7 @@ class PaymentController(Document):
 			)
 
 		try:
-			processed = self._process_response(psl, response, ref_doc)
+			processed = self._process_response(psl, ref_doc)
 			if self.flags.status_changed_to in self.flowstates.declined:
 				try:
 					msg = self._render_failure_message()
