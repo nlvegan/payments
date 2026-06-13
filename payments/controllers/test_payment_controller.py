@@ -77,6 +77,26 @@ class TestPSLContracts(unittest.TestCase):
 		self.assertTrue(callable(PaymentSessionLog.update_gateway_specific_state))
 
 
+class TestSubclassInvariants(unittest.TestCase):
+	"""Verify PaymentController enforces its flowstates/frontend_defaults
+	invariants at class-DEFINITION time via __init_subclass__ (not per
+	instantiation)."""
+
+	def test_missing_invariants_raise_at_class_definition(self):
+		with self.assertRaises(TypeError):
+
+			class _BadController(PaymentController):
+				pass  # declares neither flowstates nor frontend_defaults
+
+	def test_well_formed_subclass_defines_cleanly(self):
+		from payments.types import FrontendDefaults, SessionStates
+
+		# Should NOT raise at definition time.
+		class _GoodController(PaymentController):
+			flowstates = SessionStates(success=[], pre_authorized=[], processing=[], declined=[])
+			frontend_defaults = FrontendDefaults(gateway_css="", gateway_js="", gateway_wrapper="")
+
+
 class TestGatewayRef(unittest.TestCase):
 	def test_roundtrip(self):
 		from payments.types import GatewayRef

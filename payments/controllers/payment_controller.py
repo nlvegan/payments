@@ -133,7 +133,14 @@ class PaymentController(Document):
 
 		return filtered
 
-	def __new__(cls, *args, **kwargs):
+	def __init_subclass__(cls, **kwargs):
+		# These are subclass-definition invariants (every concrete gateway must
+		# declare flowstates/frontend_defaults as CLASS attributes), so validate
+		# them once at class-definition (import) time rather than on every
+		# instantiation. __init_subclass__ runs for subclasses only, so the
+		# PaymentController base class itself — which legitimately doesn't declare
+		# them — is never checked here.
+		super().__init_subclass__(**kwargs)
 		if not (hasattr(cls, "flowstates") and isinstance(cls.flowstates, SessionStates)):
 			raise TypeError(
 				f"{cls.__name__} must declare cls.flowstates as an instance of payments.types.SessionStates"
@@ -142,7 +149,6 @@ class PaymentController(Document):
 			raise TypeError(
 				f"{cls.__name__} must declare cls.frontend_defaults as an instance of payments.types.FrontendDefaults"
 			)
-		return super().__new__(cls)
 
 	def __init__(self, *args, **kwargs):
 		super().__init__(*args, **kwargs)
