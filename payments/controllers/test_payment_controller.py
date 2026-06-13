@@ -77,6 +77,16 @@ class TestPSLContracts(unittest.TestCase):
 		self.assertTrue(callable(PaymentSessionLog.update_gateway_specific_state))
 
 
+class TestGatewayRef(unittest.TestCase):
+	def test_roundtrip(self):
+		from payments.types import GatewayRef
+
+		ref = GatewayRef(gateway_settings="Stripe Settings", gateway_controller="acme")
+		restored = GatewayRef.from_json(ref.to_json())
+		self.assertEqual(restored.gateway_settings, "Stripe Settings")
+		self.assertEqual(restored.gateway_controller, "acme")
+
+
 # ---------------------------------------------------------------------------
 # Integration tests — require database, SDK-free demo gateway
 # ---------------------------------------------------------------------------
