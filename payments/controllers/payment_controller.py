@@ -158,7 +158,10 @@ class PaymentController(Document):
 					).format(gateway)
 				)
 
-			self = frappe.get_cached_doc(
+			# Use get_doc (not get_cached_doc) for the controller: it carries mutable
+			# per-flow `self.state`, so a cached instance could bleed state across
+			# resolutions within one request. Mirrors PaymentSessionLog.get_controller.
+			self = frappe.get_doc(
 				payment_gateway.gateway_settings,
 				payment_gateway.gateway_controller or payment_gateway.gateway_settings,  # may be a singleton
 			)
