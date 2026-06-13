@@ -80,14 +80,28 @@ merge that branch into this line first. Phases A and B do not depend on it.
 ### Data model
 
 **`payments/types.py`:**
-- `SessionType`: add `mandated_charge = "mandated_charge"`. Comment that
-  `mandate_acquisition` (€0 standalone setup) is intentionally deferred.
+- `SessionType`: add **two** members — `mandated_charge = "mandated_charge"`
+  (implemented) and `mandate_acquisition = "mandate_acquisition"`
+  (**reserved, unimplemented**). Acquisition is kept first-class in the model —
+  not redefined away — so mandate-first gateways (GoCardless) and direct-mandate
+  paths (Mollie Mandates API / €0 SEPA setup), which have no first charge to
+  piggyback on, are not boxed out. We defer the *implementation*, not the
+  *type*.
 - `TxData`: replace the stale `# TODO` line with:
   - `mandate: str | None` — reference to a `PaymentMandate` (used by
     off-session charges to select the stored payment method).
-  - `save_mandate: bool = False` — signals the first charge to persist a
-    mandate. Set by the Ref Doc at `initiate()`; **not** guest-updatable (it is
-    not added to `UPDATABLE_TX_DATA_FIELDS`).
+  - `save_mandate: bool = False` — signals the first charge to persist/activate
+    a mandate. This is **one gateway mechanism** (Stripe `setup_future_usage`;
+    Mollie `sequenceType: first`), *not* the definition of acquisition. Set by
+    the Ref Doc at `initiate()`; **not** guest-updatable (not in
+    `UPDATABLE_TX_DATA_FIELDS`).
+
+> **Two acquisition paths** (only the first is implemented now): a mandate
+> becomes usable either *on first-charge success* (Stripe `setup_future_usage`,
+> Mollie `sequenceType: first` → mandate `valid` after the first payment
+> succeeds) — the `charge` + `save_mandate` path; or *at direct creation with no
+> charge* (GoCardless, Mollie Mandates API for signed SEPA) — the reserved
+> `mandate_acquisition` path.
 
 **`PaymentMandate` base — `payments/controllers/payment_mandate.py`:**
 A thin `Document` base that concrete mandate doctypes subclass. Minimal
@@ -127,22 +141,33 @@ speculative dead surface):
 - `_initiate_mandated_charge() -> Initiated`
 - `_process_response_for_mandated_charge() -> Processed | None`
 
-**Off-session backend entry point** — the one genuinely new control-flow piece.
-Renewals have no user at `/pay`, so a static method drives the lifecycle
-server-side:
+**Shared initiation core + two entry points.** Renewals have no user at `/pay`,
+so the interactive `proceed()` funnel — which by design *waits for a user GO
+signal* — cannot express a merchant-initiated charge. Rather than duplicate the
+initiate path, we extract a shared primitive and give it two thin public entry
+points:
 
 ```python
-PaymentController.charge_mandate(mandate, tx_data) -> Processed
+def _run_initiation(self, psl, flow_type) -> Initiated  # call _initiate_<flow>, persist, return
 ```
+- `proceed(psl_name, updated_tx_data)` — **interactive**; waits for the user GO
+  signal, then `_run_initiation(psl, charge)`; presents errors as redirects.
+- `charge_mandate(mandate, tx_data, gateway=None) -> Processed` — **headless,
+  trusted** (never `@frappe.whitelist`); `_run_initiation(psl,
+  mandated_charge)` then feeds the synchronous result into the **existing**
+  `process_response()`; presents errors as a returned `Processed`.
 
 `mandate` is the `PaymentMandate` document (or its `{doctype, name}` ref); the
 method writes it onto `tx_data.mandate` before creating the session (the
-`tx_data.mandate` field is the serialized form the gateway reads back via
-`self.state.tx_data`). It creates a PSL with `flow_type=mandated_charge`, calls
-`_initiate_mandated_charge()` (which for Stripe confirms synchronously via
-`off_session=True, confirm=True`), then feeds that synchronous result straight
-into the **existing** `process_response()`. No new processing machine — it
-reuses `initiate → process`, just server-driven instead of page-driven.
+gateway reads it back via `self.state.tx_data`). `_initiate_mandated_charge()`
+for Stripe confirms synchronously via `off_session=True, confirm=True`. No new
+processing machine and no duplicated initiate path — both entry points share
+`_run_initiation` and the result flows through the same `process_response`.
+
+This is a deliberate divergence from the ancestor design (blaggacao/refactor),
+which funnels every variant through the user-present `proceed()`. That funnel
+has no place for a charge with no user GO signal; the headless entry point fills
+that gap, while the shared core preserves the single initiate pipeline.
 
 **Edge cases baked in:**
 - **Off-session `requires_action`** (bank wants SCA / mandate needs re-auth):

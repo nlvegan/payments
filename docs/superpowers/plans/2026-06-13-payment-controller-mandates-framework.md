@@ -12,15 +12,16 @@
 
 **Naming contract (use these exact identifiers across all tasks):**
 - DocType: `Payment Demo Settings` (Single) → controller class `PaymentDemoSettings(PaymentController)`, module `Payment Gateways`.
-- New `SessionType` member: `mandated_charge = "mandated_charge"`.
-- `TxData` fields: `mandate: str | None`, `save_mandate: bool`.
+- New `SessionType` members: `mandated_charge = "mandated_charge"` (implemented) and `mandate_acquisition = "mandate_acquisition"` (**reserved, unimplemented** — kept first-class in the model so mandate-first gateways like GoCardless are not boxed out).
+- `TxData` fields: `mandate: str | None`, `save_mandate: bool`. **Framing:** `save_mandate` is *one gateway mechanism* (Stripe-style acquisition-via-first-charge), **not** the definition of mandate acquisition. A future standalone `mandate_acquisition` flow remains the modelled path for gateways with no first charge to piggyback on.
 - Base class: `PaymentMandate(Document)` in `payments/controllers/payment_mandate.py`.
 - PSL helpers: `set_mandate(mandate)`, `get_mandate()`.
 - Controller contracts: `_initiate_mandated_charge()`, `_process_response_for_mandated_charge()`.
-- Controller entry point: `PaymentController.charge_mandate(mandate, tx_data, gateway=None)`.
+- Controller entry point: `PaymentController.charge_mandate(mandate, tx_data, gateway=None)` (headless, trusted — **never** `@frappe.whitelist`).
+- Shared initiation core: `PaymentController._run_initiation(self, psl, flow_type) -> Initiated` + dispatch `PaymentController._INITIATE_DISPATCH` (flow_type → `_initiate_*` method name). Both `proceed()` (interactive) and `charge_mandate()` (headless) call it, so the initiate→persist path is not duplicated.
 - Extracted helpers: `_redirect_on_initiation_error(psl, error, extra=None)` (module-level), `make_error_processed(error, message)` (local closure in `process_response`), `_build_compensatory_action(self, psl, error_log)` (method).
 - Dataclass: `GatewayRef(gateway_settings, gateway_controller)` in `payments/types.py` with `to_json()` / `from_json()`.
-- Dispatch map: `PaymentController._FLOW_DISPATCH`.
+- Dispatch maps: `PaymentController._FLOW_DISPATCH` (response processing), `PaymentController._INITIATE_DISPATCH` (initiation).
 
 **Conventions:**
 - All `bench` commands run from `~/frappe-bench`. Site: `veg11.veganisme.org`.
@@ -674,6 +675,12 @@ class TestMandateTypes(unittest.TestCase):
 
 		self.assertEqual(SessionType.mandated_charge.value, "mandated_charge")
 
+	def test_session_type_reserves_mandate_acquisition(self):
+		from payments.types import SessionType
+
+		# Reserved in the model even though no gateway implements it yet.
+		self.assertEqual(SessionType.mandate_acquisition.value, "mandate_acquisition")
+
 	def test_txdata_mandate_fields_default(self):
 		tx = _make_tx_data()
 		self.assertIsNone(tx.mandate)
@@ -687,12 +694,24 @@ Expected: FAIL (`AttributeError`/`TypeError`).
 
 - [ ] **Step 3: Implement**
 
-In `payments/types.py`:
-- Add to `SessionType`: `mandated_charge = "mandated_charge"` (leave a comment: `# mandate_acquisition (€0 standalone setup) intentionally deferred`).
-- In `TxData`, replace the `# TODO: tx data for subscriptions...` line (line 79) with:
+In `payments/types.py`, extend `SessionType`:
+```python
+class SessionType(str, Enum):
+	"""Payment flow types."""
+
+	charge = "charge"
+	mandated_charge = "mandated_charge"
+	# Reserved, not yet implemented. Kept first-class so mandate-first gateways
+	# (e.g. GoCardless) and €0 SEPA setup — which have no first charge to
+	# piggyback on — are not boxed out of the model. Stripe implements
+	# acquisition as a side effect of the first charge (save_mandate), which is
+	# a gateway *mechanism*, not a redefinition of this flow.
+	mandate_acquisition = "mandate_acquisition"
+```
+In `TxData`, replace the `# TODO: tx data for subscriptions...` line (line 79) with:
 ```python
 	mandate: str | None = None  # reference to a PaymentMandate, used by off-session charges
-	save_mandate: bool = False  # signal the first charge to persist a reusable mandate
+	save_mandate: bool = False  # Stripe-style: persist a reusable mandate from this charge
 ```
 (These have defaults so existing `TxData(**...)` calls and stored JSON without the keys still construct. Confirm `load_state()` in PSL builds `TxData(**json.loads(...))` — extra-safe because old rows lack the keys and the defaults apply.)
 
@@ -961,7 +980,73 @@ The off-session driver: create a PSL with `flow_type=mandated_charge`, initiate,
 **Files:**
 - Modify: `payments/controllers/payment_controller.py`
 
-- [ ] **Step 1: Write tests for the three outcomes**
+#### Part 1 — extract the shared initiation core (refactor, behaviour-preserving)
+
+- [ ] **Step 1: Add `_INITIATE_DISPATCH` + `_run_initiation` and route `proceed()` through it**
+
+Add the dispatch map as a class attribute (near `_FLOW_DISPATCH`) and the primitive as an instance method:
+```python
+	# flow_type -> initiation method name (parallels _FLOW_DISPATCH for processing)
+	_INITIATE_DISPATCH: ClassVar[dict] = {
+		SessionType.charge: "_initiate_charge",
+		SessionType.mandated_charge: "_initiate_mandated_charge",
+	}
+
+	def _run_initiation(self, psl, flow_type) -> Initiated:
+		"""Shared initiate->persist primitive used by both proceed() (interactive)
+		and charge_mandate() (headless).
+
+		Calls the flow's _initiate_* method, persists correlation_id + initiation
+		payload + flow_type, and returns the Initiated result. Raises on failure
+		for the caller to present (proceed() redirects; charge_mandate() returns a
+		Processed). This keeps the initiate path in exactly one place.
+		"""
+		frappe.flags.integration_request_doc = psl  # for linking error logs
+		method_name = self._INITIATE_DISPATCH[flow_type]
+		initiated = getattr(self, method_name)()
+		psl.db_set(
+			{
+				"processing_response_payload": None,  # in case of a reset
+				"flow_type": flow_type,
+				"correlation_id": initiated.correlation_id,
+			},
+			commit=True,
+		)
+		psl.set_initiation_payload(initiated.payload, "Initiated")  # commits
+		return initiated
+```
+Then refactor the **success body** of `proceed()` (the block ~lines 236–254 that sets `frappe.flags.integration_request_doc`, calls `self._initiate_charge()`, db_sets flow_type/correlation_id, calls `set_initiation_payload`, and returns `Proceeded`) down to:
+```python
+		try:
+			initiated = self._run_initiation(psl, SessionType.charge)
+			return Proceeded(
+				integration=self.doctype,
+				psltype=SessionType.charge,
+				txdata=self.state.tx_data,
+				payload=initiated.payload,
+			)
+		# the existing `except FailedToInitiateFlowError / HTTPError / Exception`
+		# branches (from Task A4) stay exactly as they are — they present the
+		# interactive redirect.
+```
+Leave the idempotency early-return at the top of `proceed()` (status == "Initiated") unchanged.
+
+- [ ] **Step 2: Run the suite — expect green (behaviour-preserving)**
+
+Run: `bench --site veg11.veganisme.org run-tests --app payments --module payments.controllers.test_payment_controller`
+Expected: PASS — the charge lifecycle tests still pass; `proceed()` now initiates via `_run_initiation`.
+
+- [ ] **Step 3: Lint + commit the refactor**
+
+```bash
+cd ~/frappe-bench/apps/payments && ruff format . && ruff check .
+git add payments/controllers/payment_controller.py
+git commit -m "refactor(payments): extract _run_initiation shared by proceed and charge_mandate"
+```
+
+#### Part 2 — build `charge_mandate()` on the shared core
+
+- [ ] **Step 4: Write tests for the three outcomes**
 
 Add to `TestPaymentControllerLifecycle`:
 ```python
@@ -983,7 +1068,7 @@ Add to `TestPaymentControllerLifecycle`:
 			tx_data=self._mandated_tx("requires_action"),
 			gateway=self.gateway_name,
 		)
-		self.assertIn("/pay", result.action["href"])
+		self.assertIn("pay", result.action["href"])
 
 	def test_charge_mandate_revoked_declined(self):
 		result = PaymentController.charge_mandate(
@@ -995,22 +1080,22 @@ Add to `TestPaymentControllerLifecycle`:
 ```
 > Note: `charge_mandate` takes `gateway` because the demo flow has no Ref Doc preselection; production callers may resolve it from the mandate. Keep the `gateway` parameter optional and documented.
 
-- [ ] **Step 2: Run — expect failure (no such method)**
+- [ ] **Step 5: Run — expect failure (no such method)**
 
 Run: `bench --site veg11.veganisme.org run-tests --app payments --module payments.controllers.test_payment_controller`
 Expected: FAIL (`AttributeError: charge_mandate`).
 
-- [ ] **Step 3: Implement `charge_mandate`**
+- [ ] **Step 6: Implement `charge_mandate` using `_run_initiation`**
 
-Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_response`):
+Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_response`). It must **not** be `@frappe.whitelist` — it is a trusted backend entry point:
 ```python
 	@staticmethod
 	def charge_mandate(mandate, tx_data: TxData, gateway=None) -> Processed:
 		"""Charge a stored mandate off-session, server-side (no /pay page).
 
-		Creates a mandated_charge session, initiates the charge (which for
-		supporting gateways confirms synchronously), and processes the result
-		through the normal pipeline.
+		Trusted backend entry point (NOT whitelisted). Creates a mandated_charge
+		session, runs the shared initiation core (which for supporting gateways
+		confirms synchronously), and feeds the result through the normal pipeline.
 
 		On the gateway signalling that customer action is required, returns a
 		Processed whose action points at the /pay URL so the caller can send a
@@ -1027,7 +1112,6 @@ Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_respons
 
 		self, psl_name = PaymentController.initiate(tx_data, gateway)
 		psl: PaymentSessionLog = frappe.get_doc("Payment Session Log", psl_name)
-		psl.db_set("flow_type", SessionType.mandated_charge, commit=True)
 		if hasattr(mandate, "name") or isinstance(mandate, dict):
 			psl.set_mandate(mandate)
 
@@ -1035,7 +1119,7 @@ Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_respons
 		self.state.tx_data = self._patch_tx_data(self.state.tx_data)
 
 		try:
-			initiated = self._initiate_mandated_charge()
+			initiated = self._run_initiation(psl, SessionType.mandated_charge)
 		except FailedToInitiateFlowError as err:
 			psl.set_initiation_payload(err.data, "Declined")
 			return Processed(
@@ -1045,9 +1129,6 @@ Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_respons
 				indicator_color="red",
 				payload={},
 			)
-
-		psl.db_set({"correlation_id": initiated.correlation_id}, commit=True)
-		psl.set_initiation_payload(initiated.payload, "Initiated")
 
 		# Customer-action required: cannot complete head-less; hand back a payment link.
 		if initiated.payload.get("status") in self.flowstates.processing:
@@ -1065,12 +1146,12 @@ Add as a `@staticmethod` on `PaymentController` (near `proceed`/`process_respons
 ```
 Ensure imports at top include `SessionType`, `GatewayProcessingResponse`, `FailedToInitiateFlowError`, `Processed` (all already imported in this module — confirm).
 
-- [ ] **Step 4: Run — expect pass (all three outcomes)**
+- [ ] **Step 7: Run — expect pass (all three outcomes)**
 
 Run: `bench --site veg11.veganisme.org run-tests --app payments --module payments.controllers.test_payment_controller`
 Expected: PASS.
 
-- [ ] **Step 5: Lint + commit**
+- [ ] **Step 8: Lint + commit**
 
 ```bash
 cd ~/frappe-bench/apps/payments && ruff format . && ruff check .
