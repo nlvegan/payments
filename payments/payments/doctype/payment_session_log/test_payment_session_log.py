@@ -69,6 +69,18 @@ class TestPaymentSessionLogTerminalStates(unittest.TestCase):
 		self.assertEqual(psl.get_indicator_color(), "gray")
 
 
+class TestSelectButtonCSRFHardening(unittest.TestCase):
+	"""M3: the guest select_button endpoint must be POST-only. Frappe skips
+	CSRF for guest sessions, so restricting to POST blocks the trivial
+	cross-origin GET/link/<img> vectors."""
+
+	def test_select_button_is_post_only(self):
+		methods = frappe.allowed_http_methods_for_whitelisted_func.get(select_button)
+		self.assertIsNotNone(methods, "select_button is not registered as whitelisted")
+		self.assertEqual(methods, ["POST"])
+		self.assertNotIn("GET", methods)
+
+
 class TestErrorRefShortening(unittest.TestCase):
 	"""M4: guest-facing failure messages must reference a short opaque code,
 	not the full Error Log docname (which embeds internal timestamp/naming)."""

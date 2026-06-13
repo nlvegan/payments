@@ -168,7 +168,17 @@ def _error_ref(error_log) -> str:
 	return str(error_log)[-8:]
 
 
-@frappe.whitelist(allow_guest=True)
+# CSRF (M3): Frappe skips CSRF validation for guest sessions, so this guest
+# endpoint could otherwise be driven by a cross-origin POST. Restricting it to
+# POST blocks the trivial GET/<img>/link vectors and simple cross-origin form
+# submits that don't already know the ~35-bit PSL name. Residual risk: a fully
+# scripted cross-origin POST (fetch/XHR) is still possible if the attacker
+# knows a valid, non-terminal PSL name; impact is bounded (it only switches
+# among already-enabled buttons matching the PSL's gateway filter, never alters
+# amount/refdoc). A per-session CSRF token issued in the /pay page context is
+# the recommended follow-up; deliberately not built here to avoid half-baked
+# token infra on this branch.
+@frappe.whitelist(allow_guest=True, methods=["POST"])
 def select_button(pslName: str | None = None, buttonName: str | None = None) -> str:
 	"""Select a payment button for a payment session.
 
