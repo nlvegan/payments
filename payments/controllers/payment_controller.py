@@ -358,10 +358,13 @@ class PaymentController(Document):
 			+ self.flowstates.declined
 		)
 		if self.flags.status_changed_to not in all_states:
-			raise ValueError(
-				"self.flags.status_changed_to must be in the set of possible states for this controller:\n - {}".format(
-					"\n - ".join(all_states)
-				)
+			# An unmapped status must surface as a handled error: process_response's
+			# outer try only catches PaymentControllerProcessingError (and siblings),
+			# not a bare ValueError. Raising ValueError here would escape with a
+			# traceback and return nothing to the frontend; raise the controller
+			# error so the existing error path renders a clean red Processed.
+			raise PaymentControllerProcessingError(
+				f"Gateway returned an unmapped status: {self.flags.status_changed_to}", "charge"
 			)
 
 		ret = {

@@ -214,6 +214,21 @@ class TestPaymentControllerLifecycle(IntegrationTestCase):
 		self.assertEqual(result.payload, {})
 		self.assertIsInstance(result.action, dict)
 
+	def test_process_response_unmapped_status_is_handled(self):
+		"""A status that is in no flowstate category (success/pre_authorized/
+		processing/declined) must surface as a clean error Processed, not an
+		uncaught ValueError traceback that returns nothing to the frontend."""
+		tx_data = _make_tx_data()
+		_controller, psl_name = PaymentController.initiate(tx_data, self.gateway_name)
+		PaymentController.proceed(psl_name)
+		# "unknown" is not declared in PaymentDemoSettings.flowstates
+		response = GatewayProcessingResponse(hash=None, message=None, payload={"status": "unknown"})
+		result = PaymentController.process_response(psl_name, response)
+		self.assertEqual(result.indicator_color, "red")
+		self.assertEqual(result.status_changed_to, frappe._("Server Error"))
+		self.assertEqual(result.payload, {})
+		self.assertIsInstance(result.action, dict)
+
 	# -- process_response: lock contention --
 
 	def test_process_response_lock_contention_returns_state(self):
