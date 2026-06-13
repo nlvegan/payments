@@ -312,6 +312,21 @@ class PaymentController(Document):
 			return dict(href=href, label=_("Email Us"))
 		return fallback_action
 
+	def _build_compensatory_action(self, psl, error_log):
+		return self._build_support_action(
+			psl,
+			subject=_("Payment Server Error: {}").format(error_log),
+			# nosemgrep: frappe-translation-python-splitting - newlines in email body are intentional
+			body=_("Reference:\n\n- PSL: {}\n- Error Log: {}\n- RefDoc: {}\n\nThank you!").format(
+				frappe.utils.get_url_to_form("Payment Session Log", psl.name),
+				frappe.utils.get_url_to_form("Error Log", error_log.name),
+				frappe.utils.get_url_to_form(
+					self.state.tx_data.reference_doctype, self.state.tx_data.reference_docname
+				),
+			),
+			fallback_action=dict(href="/", label=_("Go to Homepage")),
+		)
+
 	# Status category → (psl_status, indicator_color, message_template, action_label)
 	# Note: action labels are raw strings; wrapped in _() at render time to support i18n.
 	# Translation markers for extraction: _("Go to Homepage"), _("Refresh")
@@ -483,25 +498,10 @@ class PaymentController(Document):
 
 		mute = self._is_server_to_server()
 
-		def get_compensatory_action(error_log):
-			return self._build_support_action(
-				psl,
-				subject=_("Payment Server Error: {}").format(error_log),
-				# nosemgrep: frappe-translation-python-splitting - newlines in email body are intentional
-				body=_("Reference:\n\n- PSL: {}\n- Error Log: {}\n- RefDoc: {}\n\nThank you!").format(
-					frappe.utils.get_url_to_form("Payment Session Log", psl.name),
-					frappe.utils.get_url_to_form("Error Log", error_log.name),
-					frappe.utils.get_url_to_form(
-						self.state.tx_data.reference_doctype, self.state.tx_data.reference_docname
-					),
-				),
-				fallback_action=dict(href="/", label=_("Go to Homepage")),
-			)
-
 		def make_error_processed(error, message):
 			return Processed(
 				message=message,
-				action=get_compensatory_action(error),
+				action=self._build_compensatory_action(psl, error),
 				status_changed_to=_("Server Error"),
 				indicator_color="red",
 				payload={},
