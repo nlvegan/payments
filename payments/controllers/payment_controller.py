@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, ClassVar
+from typing import TYPE_CHECKING, ClassVar, NoReturn
 from urllib.parse import quote, urlencode
 
 import frappe
@@ -48,6 +48,25 @@ def _error_value(error, flow):
 	return _(
 		"Our server had a problem processing your {0}. Please contact customer support mentioning: {1}"
 	).format(flow, error)
+
+
+def _redirect_on_initiation_error(psl, error, *, include_psl: bool = False) -> NoReturn:
+	"""Redirect the user to a generic payment-gateway error message and raise.
+
+	``psl`` is only interpolated into the message when ``include_psl`` is True.
+	Always raises ``frappe.Redirect`` — callers never resume after this.
+	"""
+	if include_psl:
+		body = _("Please contact customer care mentioning: {0} and {1}").format(psl, error)
+	else:
+		body = _("Please contact customer care mentioning: {0}").format(error)
+	frappe.redirect_to_message(
+		_("Payment Gateway Error"),
+		body,
+		http_status_code=401,
+		indicator_color="yellow",
+	)
+	raise frappe.Redirect
 
 
 class PaymentController(Document):
@@ -257,36 +276,18 @@ class PaymentController(Document):
 		except FailedToInitiateFlowError as err:
 			psl.set_initiation_payload(err.data, "Error")
 			error = psl.log_error(title=err.message)
-			frappe.redirect_to_message(
-				_("Payment Gateway Error"),
-				_("Please contact customer care mentioning: {0} and {1}").format(psl, error),
-				http_status_code=401,
-				indicator_color="yellow",
-			)
-			raise frappe.Redirect
+			_redirect_on_initiation_error(psl, error, include_psl=True)
 
 		# ... yet others do ...
 		except HTTPError:
 			data = frappe.flags.integration_request.json()
 			psl.set_initiation_payload(data, "Error")
 			error = frappe.get_last_doc("Error Log")
-			frappe.redirect_to_message(
-				_("Payment Gateway Error"),
-				_("Please contact customer care mentioning: {0} and {1}").format(psl, error),
-				http_status_code=401,
-				indicator_color="yellow",
-			)
-			raise frappe.Redirect
+			_redirect_on_initiation_error(psl, error, include_psl=True)
 
 		except Exception:
 			error = psl.log_error(title="Unknown Initialization Failure")
-			frappe.redirect_to_message(
-				_("Payment Gateway Error"),
-				_("Please contact customer care mentioning: {0}").format(error),
-				http_status_code=401,
-				indicator_color="yellow",
-			)
-			raise frappe.Redirect
+			_redirect_on_initiation_error(psl, error)
 
 	def _get_support_email(self):
 		"""Look up the support email for the reference document, falling back to default incoming."""

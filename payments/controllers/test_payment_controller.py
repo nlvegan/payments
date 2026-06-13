@@ -204,6 +204,22 @@ class TestPaymentControllerLifecycle(IntegrationTestCase):
 		self.assertEqual(result.payload, {})
 		self.assertIsInstance(result.action, dict)
 
+	# -- proceed: error paths --
+
+	def test_proceed_redirects_on_initiation_failure(self):
+		from payments.exceptions import FailedToInitiateFlowError
+
+		tx_data = _make_tx_data()
+		_controller, psl_name = PaymentController.initiate(tx_data, self.gateway_name)
+		with patch.object(
+			PaymentDemoSettings,
+			"_initiate_charge",
+			side_effect=FailedToInitiateFlowError("nope", {"err": 1}),
+		):
+			with self.assertRaises(frappe.Redirect):
+				PaymentController.proceed(psl_name)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Error")
+
 	# -- pre_data_capture_hook --
 
 	def test_pre_data_capture_hook_stores_state(self):
