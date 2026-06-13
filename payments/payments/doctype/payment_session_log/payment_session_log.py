@@ -210,8 +210,9 @@ def select_button(pslName: str | None = None, buttonName: str | None = None) -> 
 		btn: PaymentButton = frappe.get_cached_doc("Payment Button", buttonName)
 	except Exception:
 		e = frappe.log_error("Payment Button not found", reference_doctype="Payment Button")
-		# Ensure no more details are leaked than the error log reference
-		frappe.local.message_log = [_("Server Failure!<br>{}").format(e)]
+		# Return an opaque correlation code, not the Error Log docname (M4),
+		# matching the PSL-not-found path above.
+		frappe.local.message_log = [_("Server Failure! Reference: {0}").format(_error_ref(e))]
 		return
 
 	# Validate button is enabled
