@@ -8,6 +8,13 @@ class SessionType(str, Enum):
 	"""Payment flow types."""
 
 	charge = "charge"
+	mandated_charge = "mandated_charge"
+	# Reserved, not yet implemented. Kept first-class so mandate-first gateways
+	# (e.g. GoCardless) and €0 SEPA setup — which have no first charge to
+	# piggyback on — are not boxed out of the model. Stripe implements
+	# acquisition as a side effect of the first charge (save_mandate), which is
+	# a gateway *mechanism*, not a redefinition of this flow.
+	mandate_acquisition = "mandate_acquisition"
 
 
 @dataclass
@@ -78,7 +85,8 @@ class TxData:
 	payer_address: dict  # as: address.as_dict()
 	loyalty_points: tuple[str, float] | None  # (label, value) pair; display purpose only
 	discount_amount: float | None  # for display purpose only
-	# TODO: tx data for subscriptions, pre-authorized, require-mandate and other flows
+	mandate: str | None = None  # reference to a PaymentMandate, used by off-session charges
+	save_mandate: bool = False  # Stripe-style: persist a reusable mandate from this charge
 
 
 @dataclass(frozen=True)

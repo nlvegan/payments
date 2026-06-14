@@ -107,6 +107,24 @@ class TestGatewayRef(unittest.TestCase):
 		self.assertEqual(restored.gateway_controller, "acme")
 
 
+class TestMandateTypes(unittest.TestCase):
+	def test_session_type_has_mandated_charge(self):
+		from payments.types import SessionType
+
+		self.assertEqual(SessionType.mandated_charge.value, "mandated_charge")
+
+	def test_session_type_reserves_mandate_acquisition(self):
+		from payments.types import SessionType
+
+		# Reserved in the model even though no gateway implements it yet.
+		self.assertEqual(SessionType.mandate_acquisition.value, "mandate_acquisition")
+
+	def test_txdata_mandate_fields_default(self):
+		tx = _make_tx_data()
+		self.assertIsNone(tx.mandate)
+		self.assertFalse(tx.save_mandate)
+
+
 # ---------------------------------------------------------------------------
 # Integration tests — require database, SDK-free demo gateway
 # ---------------------------------------------------------------------------
@@ -310,3 +328,64 @@ class TestPaymentControllerLifecycle(IntegrationTestCase):
 		data = PaymentController.pre_data_capture_hook(psl_name)
 		self.assertIsInstance(data, dict)
 		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Data Capture")
+
+	def test_psl_set_and_get_mandate(self):
+		tx_data = _make_tx_data()
+		_controller, psl_name = PaymentController.initiate(tx_data, self.gateway_name)
+		psl = frappe.get_doc("Payment Session Log", psl_name)
+		psl.set_mandate({"doctype": "Payment Demo Settings", "name": "Payment Demo Settings"})
+		ref = psl.get_mandate()
+		self.assertEqual(ref["doctype"], "Payment Demo Settings")
+		self.assertEqual(ref["name"], "Payment Demo Settings")
+
+	# -- charge_mandate --
+
+	def test_charge_mandate_success(self):
+		result = PaymentController.charge_mandate(
+			mandate="pm_ok", tx_data=_make_tx_data(amount=10.0), gateway=self.gateway_name
+		)
+		self.assertEqual(result.indicator_color, "green")
+		self.assertEqual(result.status_changed_to, "succeeded")
+
+	def test_charge_mandate_requires_action_returns_url(self):
+		result = PaymentController.charge_mandate(
+			mandate="requires_action", tx_data=_make_tx_data(amount=10.0), gateway=self.gateway_name
+		)
+		self.assertIn("pay", result.action["href"])
+
+	def test_charge_mandate_revoked_declined(self):
+		result = PaymentController.charge_mandate(
+			mandate="revoked", tx_data=_make_tx_data(amount=10.0), gateway=self.gateway_name
+		)
+		self.assertEqual(result.indicator_color, "red")
+
+	def test_charge_mandate_then_reprocess_is_terminal(self):
+		# First charge succeeds and reaches Paid (terminal).
+		result = PaymentController.charge_mandate(
+			mandate="pm_ok", tx_data=_make_tx_data(amount=10.0), gateway=self.gateway_name
+		)
+		self.assertEqual(result.indicator_color, "green")
+		# Re-processing the same PSL is a no-op terminal return (guarded by is_terminal()).
+		psl_name = frappe.get_all(
+			"Payment Session Log",
+			filters={"flow_type": "mandated_charge", "status": "Paid"},
+			order_by="creation desc",
+			limit=1,
+		)[0].name
+		again = PaymentController.process_response(
+			psl_name, GatewayProcessingResponse(hash=None, message=None, payload={"status": "succeeded"})
+		)
+		self.assertEqual(again.status_changed_to, "Paid")
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — PaymentMandate base class
+# ---------------------------------------------------------------------------
+
+
+class TestPaymentMandateBase(unittest.TestCase):
+	def test_base_declares_contract(self):
+		from payments.controllers.payment_mandate import PaymentMandate
+
+		self.assertTrue(hasattr(PaymentMandate, "is_usable"))
+		self.assertTrue(hasattr(PaymentMandate, "revoke"))
