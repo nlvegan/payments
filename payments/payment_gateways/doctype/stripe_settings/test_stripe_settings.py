@@ -1177,12 +1177,32 @@ class TestStripeSaveMandateInitiation(unittest.TestCase):
 		self.assertNotIn("setup_future_usage", kwargs)
 		self.assertNotIn("customer", kwargs)
 
+	def test_save_mandate_without_email_skips_mandate(self):
+		ctrl = self._controller(save_mandate=True)
+		ctrl.state.tx_data.payer_contact = {}  # no email
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_1", client_secret="cs_1")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "log_error") as log_error,
+		):
+			ctrl._initiate_charge()
+		_args, kwargs = fake_stripe.PaymentIntent.create.call_args
+		self.assertNotIn("setup_future_usage", kwargs)
+		self.assertNotIn("customer", kwargs)
+		log_error.assert_called_once()
+
 
 class TestStripeEnsureCustomer(unittest.TestCase):
 	def _controller(self):
 		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
 
-		return StripeSettings.__new__(StripeSettings)
+		ctrl = StripeSettings.__new__(StripeSettings)
+		ctrl.doctype = "Stripe Settings"
+		ctrl.name = "MandateTest"
+		return ctrl
 
 	def test_reuses_existing_active_mandate_customer(self):
 		ctrl = self._controller()
@@ -1225,6 +1245,7 @@ class TestStripePersistMandate(unittest.TestCase):
 
 	def test_persist_creates_mandate_and_links_psl(self):
 		ctrl, _psl = self._controller()
+		ctrl.state.psl.name = "psl-1"
 		payload = {"status": "succeeded", "customer": "cus_1", "payment_method": "pm_1"}
 		created = MagicMock()
 		created.name = "SM-0001"
@@ -1243,6 +1264,7 @@ class TestStripePersistMandate(unittest.TestCase):
 		self.assertEqual(dict_calls[0]["doctype"], "Stripe Mandate")
 		self.assertEqual(dict_calls[0]["customer_id"], "cus_1")
 		self.assertEqual(dict_calls[0]["payment_method_id"], "pm_1")
+		self.assertEqual(dict_calls[0]["payment_session_log"], "psl-1")
 		created.insert.assert_called_once()
 		psl_doc.set_mandate.assert_called_once_with(created)
 
@@ -1332,6 +1354,7 @@ class TestStripeMandatedCharge(unittest.TestCase):
 	def test_initiate_mandated_charge_sends_off_session_confirm(self):
 		ctrl = self._controller()
 		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
 		fake_stripe = MagicMock()
 		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_9", status="succeeded")
 		with (
@@ -1357,6 +1380,7 @@ class TestStripeMandatedCharge(unittest.TestCase):
 
 		ctrl = self._controller()
 		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
 		fake_stripe = MagicMock()
 		fake_stripe.PaymentIntent.create.side_effect = CardError(
 			"Your card was declined.", None, "card_declined"
@@ -1377,6 +1401,35 @@ class TestStripeMandatedCharge(unittest.TestCase):
 		ctrl.state.tx_data.mandate = None
 		with self.assertRaises(FailedToInitiateFlowError):
 			ctrl._initiate_mandated_charge()
+
+	def test_initiate_mandated_charge_unusable_mandate_raises(self):
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		mandate = MagicMock(status="Revoked")
+		mandate.is_usable.return_value = False
+		with patch.object(frappe, "get_doc", return_value=mandate):
+			with self.assertRaises(FailedToInitiateFlowError):
+				ctrl._initiate_mandated_charge()
+
+	def test_initiate_mandated_charge_api_error_raises_flow_error(self):
+		from stripe.error import APIConnectionError
+
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.side_effect = APIConnectionError("network down")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "get_doc", return_value=mandate),
+		):
+			with self.assertRaises(FailedToInitiateFlowError):
+				ctrl._initiate_mandated_charge()
 
 	def test_process_response_for_mandated_charge_sets_status(self):
 		ctrl = self._controller()

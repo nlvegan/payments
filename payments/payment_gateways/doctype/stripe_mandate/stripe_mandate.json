@@ -10,7 +10,8 @@
   "payment_method_id",
   "mandate_reference",
   "status",
-  "payer"
+  "payer",
+  "payment_session_log"
  ],
  "fields": [
   {"fieldname": "gateway_settings", "fieldtype": "Data", "label": "Gateway Settings", "reqd": 1},
@@ -19,7 +20,8 @@
   {"fieldname": "payment_method_id", "fieldtype": "Data", "label": "Payment Method ID"},
   {"fieldname": "mandate_reference", "fieldtype": "Data", "label": "Mandate Reference"},
   {"fieldname": "status", "fieldtype": "Select", "label": "Status", "options": "Active\nRevoked", "default": "Active"},
-  {"fieldname": "payer", "fieldtype": "Data", "label": "Payer"}
+  {"fieldname": "payer", "fieldtype": "Data", "label": "Payer"},
+  {"fieldname": "payment_session_log", "fieldtype": "Data", "label": "Payment Session Log"}
  ],
  "links": [],
  "modified": "2026-06-13 00:00:00.000000",

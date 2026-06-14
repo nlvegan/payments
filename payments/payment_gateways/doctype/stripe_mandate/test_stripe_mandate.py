@@ -56,3 +56,18 @@ class TestStripeMandate(IntegrationTestCase):
 	def test_is_usable_false_when_payment_method_blank(self):
 		m = _make_mandate(payment_method_id="")
 		self.assertFalse(m.is_usable())
+
+	def test_revoke_tolerates_already_detached(self):
+		from stripe.error import InvalidRequestError
+
+		m = _make_mandate()
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentMethod.detach.side_effect = InvalidRequestError("No such PaymentMethod", None)
+		fake_controller = MagicMock()
+		fake_controller.get_stripe_api_key.return_value = "sk_test_x"
+		with (
+			patch.dict("sys.modules", {"stripe": fake_stripe}),
+			patch.object(frappe, "get_cached_doc", return_value=fake_controller),
+		):
+			m.revoke()  # must NOT raise
+		self.assertEqual(frappe.get_doc("Stripe Mandate", m.name).status, "Revoked")

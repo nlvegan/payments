@@ -10,7 +10,7 @@ import stripe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.utils import call_hook_method, flt, get_url
-from stripe.error import CardError, InvalidRequestError
+from stripe.error import StripeError
 
 from payments.controllers import PaymentController
 from payments.exceptions import FailedToInitiateFlowError
@@ -380,7 +380,12 @@ class StripeSettings(PaymentController):
 		"""
 		existing = frappe.get_all(
 			"Stripe Mandate",
-			filters={"payer": payer_email, "status": "Active"},
+			filters={
+				"payer": payer_email,
+				"status": "Active",
+				"gateway_settings": self.doctype,
+				"gateway_controller": self.name,
+			},
 			fields=["customer_id"],
 			limit=1,
 		)
@@ -657,8 +662,15 @@ class StripeSettings(PaymentController):
 		)
 
 		if tx_data.save_mandate:
-			intent_params["customer"] = self._ensure_stripe_customer(payer_email)
-			intent_params["setup_future_usage"] = "off_session"
+			if payer_email:
+				intent_params["customer"] = self._ensure_stripe_customer(payer_email)
+				intent_params["setup_future_usage"] = "off_session"
+			else:
+				frappe.log_error(
+					title="Stripe: save_mandate skipped (no payer email)",
+					message=f"PSL {psl.name} requested save_mandate but payer_contact has no email; "
+					"charging without saving a reusable mandate.",
+				)
 
 		intent = stripe.PaymentIntent.create(
 			**intent_params,
@@ -678,6 +690,8 @@ class StripeSettings(PaymentController):
 
 	def _validate_response(self) -> None:
 		"""Validate the webhook signature for server-to-server responses."""
+		if self.state.psl.flow_type == SessionType.mandated_charge:
+			return  # synchronous off-session result is self-originated; no re-verification needed
 		response = self.state.response
 
 		# For webhook responses, signature is already validated in stripe_webhook()
@@ -731,7 +745,12 @@ class StripeSettings(PaymentController):
 
 		existing = frappe.get_all(
 			"Stripe Mandate",
-			filters={"customer_id": customer_id, "payment_method_id": payment_method_id},
+			filters={
+				"customer_id": customer_id,
+				"payment_method_id": payment_method_id,
+				"gateway_settings": self.doctype,
+				"gateway_controller": self.name,
+			},
 			fields=["name"],
 			limit=1,
 		)
@@ -751,6 +770,7 @@ class StripeSettings(PaymentController):
 				"mandate_reference": self._intent_field(payload, "mandate"),
 				"status": "Active",
 				"payer": self._get_payer_email(self.state.tx_data.payer_contact),
+				"payment_session_log": self.state.psl.name,
 			}
 		)
 		mandate.insert(ignore_permissions=True)
@@ -785,6 +805,11 @@ class StripeSettings(PaymentController):
 		if not tx_data.mandate:
 			raise FailedToInitiateFlowError(_("No mandate is set for this charge."), {"psl": psl.name})
 		mandate = frappe.get_doc("Stripe Mandate", tx_data.mandate)
+		if not mandate.is_usable():
+			raise FailedToInitiateFlowError(
+				_("The stored mandate is no longer usable."),
+				{"mandate": tx_data.mandate, "status": mandate.status},
+			)
 
 		stripe.api_key = self.get_stripe_api_key()
 		stripe.api_version = STRIPE_API_VERSION
@@ -804,7 +829,7 @@ class StripeSettings(PaymentController):
 				},
 				idempotency_key=f"psl-{psl.name}",
 			)
-		except (CardError, InvalidRequestError) as e:
+		except StripeError as e:
 			raise FailedToInitiateFlowError(str(e), {"stripe_error": getattr(e, "code", None)}) from e
 
 		return Initiated(
