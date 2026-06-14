@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 import frappe
 from frappe.tests import IntegrationTestCase
+from stripe.error import CardError
 
 from payments.payment_gateways.doctype.stripe_settings.stripe_settings import (
 	CURRENCY_MINIMUM_AMOUNTS,
@@ -791,6 +792,7 @@ class TestStripePaymentControllerMethods(unittest.TestCase):
 		settings.gateway_name = "Test"
 		settings.state = frappe._dict()
 		settings.state.response = frappe._dict(hash="webhook_signature_hash")
+		settings.state.psl = frappe._dict(flow_type="charge")
 
 		result = settings._is_server_to_server()
 
@@ -802,6 +804,7 @@ class TestStripePaymentControllerMethods(unittest.TestCase):
 		settings.gateway_name = "Test"
 		settings.state = frappe._dict()
 		settings.state.response = frappe._dict(hash=None)
+		settings.state.psl = frappe._dict(flow_type="charge")
 
 		result = settings._is_server_to_server()
 
@@ -1101,3 +1104,441 @@ class TestStripeWebhookV2Integration(IntegrationTestCase):
 			self.settings.handle_webhook_event(event)
 		via_psl.assert_not_called()
 		legacy.assert_called_once()
+
+
+class TestStripeIntentStatusMapping(unittest.TestCase):
+	def test_map_intent_status_dict_payload(self):
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		self.assertEqual(ctrl._map_intent_status({"status": "succeeded"}), "succeeded")
+
+	def test_map_intent_status_object_payload(self):
+		from types import SimpleNamespace
+
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		obj = SimpleNamespace(status="requires_action")
+		self.assertEqual(ctrl._map_intent_status(obj), "requires_action")
+
+	def test_intent_field_missing_key_returns_none(self):
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		self.assertIsNone(StripeSettings._intent_field({"status": "x"}, "customer"))
+
+
+class TestStripeSaveMandateInitiation(unittest.TestCase):
+	def _controller(self, *, save_mandate):
+		from types import SimpleNamespace
+
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		ctrl.publishable_key = "pk_test_x"
+		tx_data = SimpleNamespace(
+			amount=10.0,
+			currency="EUR",
+			reference_doctype="X",
+			reference_docname="X-1",
+			payer_contact={"email": "payer@example.com"},
+			save_mandate=save_mandate,
+			mandate=None,
+		)
+		ctrl.state = SimpleNamespace(tx_data=tx_data, psl=SimpleNamespace(name="psl-1"))
+		return ctrl
+
+	def test_save_mandate_adds_setup_future_usage_and_customer(self):
+		ctrl = self._controller(save_mandate=True)
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_1", client_secret="cs_1")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "_ensure_stripe_customer", return_value="cus_1"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+		):
+			ctrl._initiate_charge()
+		_args, kwargs = fake_stripe.PaymentIntent.create.call_args
+		self.assertEqual(kwargs["customer"], "cus_1")
+		self.assertEqual(kwargs["setup_future_usage"], "off_session")
+
+	def test_no_save_mandate_omits_setup_future_usage(self):
+		ctrl = self._controller(save_mandate=False)
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_1", client_secret="cs_1")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+		):
+			ctrl._initiate_charge()
+		_args, kwargs = fake_stripe.PaymentIntent.create.call_args
+		self.assertNotIn("setup_future_usage", kwargs)
+		self.assertNotIn("customer", kwargs)
+
+	def test_save_mandate_without_email_skips_mandate(self):
+		ctrl = self._controller(save_mandate=True)
+		ctrl.state.tx_data.payer_contact = {}  # no email
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_1", client_secret="cs_1")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "log_error") as log_error,
+		):
+			ctrl._initiate_charge()
+		_args, kwargs = fake_stripe.PaymentIntent.create.call_args
+		self.assertNotIn("setup_future_usage", kwargs)
+		self.assertNotIn("customer", kwargs)
+		log_error.assert_called_once()
+
+
+class TestStripeEnsureCustomer(unittest.TestCase):
+	def _controller(self):
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		ctrl.doctype = "Stripe Settings"
+		ctrl.name = "MandateTest"
+		return ctrl
+
+	def test_reuses_existing_active_mandate_customer(self):
+		ctrl = self._controller()
+		fake_stripe = MagicMock()
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(frappe, "get_all", return_value=[frappe._dict({"customer_id": "cus_existing"})]),
+		):
+			result = ctrl._ensure_stripe_customer("payer@example.com")
+		self.assertEqual(result, "cus_existing")
+		fake_stripe.Customer.create.assert_not_called()
+
+	def test_creates_customer_when_none_exists(self):
+		ctrl = self._controller()
+		fake_stripe = MagicMock()
+		fake_stripe.Customer.create.return_value = MagicMock(id="cus_new")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(frappe, "get_all", return_value=[]),
+		):
+			result = ctrl._ensure_stripe_customer("new@example.com")
+		self.assertEqual(result, "cus_new")
+		fake_stripe.Customer.create.assert_called_once_with(email="new@example.com")
+
+
+class TestStripePersistMandate(unittest.TestCase):
+	def _controller(self):
+		from types import SimpleNamespace
+
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		ctrl.doctype = "Stripe Settings"
+		ctrl.name = "Stripe Settings"
+		tx_data = SimpleNamespace(payer_contact={"email": "payer@example.com"}, save_mandate=True)
+		psl = MagicMock()
+		ctrl.state = SimpleNamespace(tx_data=tx_data, psl=psl, response=SimpleNamespace())
+		return ctrl, psl
+
+	def test_persist_creates_mandate_and_links_psl(self):
+		ctrl, _psl = self._controller()
+		ctrl.state.psl.name = "psl-1"
+		payload = {"status": "succeeded", "customer": "cus_1", "payment_method": "pm_1"}
+		created = MagicMock()
+		created.name = "SM-0001"
+		psl_doc = MagicMock()
+
+		def fake_get_doc(arg, *a, **k):
+			return psl_doc if arg == "Payment Session Log" else created
+
+		with (
+			patch.object(frappe, "get_all", return_value=[]),
+			patch.object(frappe, "get_doc", side_effect=fake_get_doc) as get_doc,
+		):
+			ctrl._persist_mandate(payload)
+		dict_calls = [c.args[0] for c in get_doc.call_args_list if isinstance(c.args[0], dict)]
+		self.assertEqual(len(dict_calls), 1)
+		self.assertEqual(dict_calls[0]["doctype"], "Stripe Mandate")
+		self.assertEqual(dict_calls[0]["customer_id"], "cus_1")
+		self.assertEqual(dict_calls[0]["payment_method_id"], "pm_1")
+		self.assertEqual(dict_calls[0]["payment_session_log"], "psl-1")
+		created.insert.assert_called_once()
+		psl_doc.set_mandate.assert_called_once_with(created)
+
+	def test_persist_reuses_existing_mandate(self):
+		ctrl, _psl = self._controller()
+		payload = {"status": "succeeded", "customer": "cus_1", "payment_method": "pm_1"}
+		existing_doc = MagicMock()
+		psl_doc = MagicMock()
+
+		def fake_get_doc(arg, *a, **k):
+			return psl_doc if arg == "Payment Session Log" else existing_doc
+
+		with (
+			patch.object(frappe, "get_all", return_value=[frappe._dict({"name": "SM-EXIST"})]),
+			patch.object(frappe, "get_doc", side_effect=fake_get_doc) as get_doc,
+		):
+			ctrl._persist_mandate(payload)
+		get_doc.assert_any_call("Stripe Mandate", "SM-EXIST")
+		existing_doc.insert.assert_not_called()
+		psl_doc.set_mandate.assert_called_once_with(existing_doc)
+
+	def test_process_response_persists_on_success_with_save_mandate(self):
+		from types import SimpleNamespace
+
+		ctrl, _psl = self._controller()
+		ctrl.flags = MagicMock()
+		ctrl.state.response = SimpleNamespace(payload={"status": "succeeded"})
+		with patch.object(ctrl, "_persist_mandate") as persist:
+			ctrl._process_response_for_charge()
+		persist.assert_called_once()
+
+	def test_process_response_skips_persist_when_declined(self):
+		from types import SimpleNamespace
+
+		ctrl, _psl = self._controller()
+		ctrl.flags = MagicMock()
+		ctrl.state.response = SimpleNamespace(payload={"status": "requires_payment_method"})
+		with patch.object(ctrl, "_persist_mandate") as persist:
+			ctrl._process_response_for_charge()
+		persist.assert_not_called()
+
+	def test_process_response_skips_persist_when_not_save_mandate(self):
+		from types import SimpleNamespace
+
+		ctrl, _psl = self._controller()
+		ctrl.state.tx_data.save_mandate = False
+		ctrl.flags = MagicMock()
+		ctrl.state.response = SimpleNamespace(payload={"status": "succeeded"})
+		with patch.object(ctrl, "_persist_mandate") as persist:
+			ctrl._process_response_for_charge()
+		persist.assert_not_called()
+
+	def test_persist_noop_without_payment_method(self):
+		ctrl, _psl = self._controller()
+		payload = {"status": "succeeded", "customer": "cus_1"}  # no payment_method
+		with patch.object(frappe, "get_doc") as get_doc:
+			ctrl._persist_mandate(payload)
+		get_doc.assert_not_called()
+
+
+class TestStripeMandatedCharge(unittest.TestCase):
+	def _controller(self, *, flow_type="mandated_charge", response_hash=None):
+		from types import SimpleNamespace
+
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		tx_data = SimpleNamespace(
+			amount=10.0,
+			currency="EUR",
+			reference_doctype="X",
+			reference_docname="X-1",
+			payer_contact={"email": "payer@example.com"},
+			mandate="SM-0001",
+		)
+		psl = MagicMock()
+		psl.name = "psl-2"
+		psl.flow_type = flow_type
+		psl.get_mandate.return_value = {"doctype": "Stripe Mandate", "name": "SM-0001"}
+		ctrl.state = SimpleNamespace(
+			tx_data=tx_data,
+			psl=psl,
+			response=SimpleNamespace(hash=response_hash, payload={"status": "succeeded"}),
+		)
+		return ctrl
+
+	def test_initiate_mandated_charge_sends_off_session_confirm(self):
+		ctrl = self._controller()
+		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = MagicMock(id="pi_9", status="succeeded")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "get_doc", return_value=mandate),
+		):
+			initiated = ctrl._initiate_mandated_charge()
+		_args, kwargs = fake_stripe.PaymentIntent.create.call_args
+		self.assertTrue(kwargs["off_session"])
+		self.assertTrue(kwargs["confirm"])
+		self.assertEqual(kwargs["customer"], "cus_1")
+		self.assertEqual(kwargs["payment_method"], "pm_1")
+		self.assertEqual(kwargs["idempotency_key"], "psl-psl-2")
+		self.assertEqual(kwargs["amount"], 1000)
+		self.assertEqual(kwargs["currency"], "eur")
+		self.assertEqual(initiated.correlation_id, "pi_9")
+		self.assertEqual(initiated.payload["status"], "succeeded")
+
+	def test_initiate_mandated_charge_card_declined_raises_flow_error(self):
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.side_effect = CardError(
+			"Your card was declined.", None, "card_declined"
+		)
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "get_doc", return_value=mandate),
+		):
+			with self.assertRaises(FailedToInitiateFlowError):
+				ctrl._initiate_mandated_charge()
+
+	def test_initiate_mandated_charge_without_mandate_raises_flow_error(self):
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		ctrl.state.tx_data.mandate = None
+		with self.assertRaises(FailedToInitiateFlowError):
+			ctrl._initiate_mandated_charge()
+
+	def test_initiate_mandated_charge_unusable_mandate_raises(self):
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		mandate = MagicMock(status="Revoked")
+		mandate.is_usable.return_value = False
+		with patch.object(frappe, "get_doc", return_value=mandate):
+			with self.assertRaises(FailedToInitiateFlowError):
+				ctrl._initiate_mandated_charge()
+
+	def test_initiate_mandated_charge_api_error_raises_flow_error(self):
+		from stripe.error import APIConnectionError
+
+		from payments.exceptions import FailedToInitiateFlowError
+
+		ctrl = self._controller()
+		mandate = MagicMock(customer_id="cus_1", payment_method_id="pm_1")
+		mandate.is_usable.return_value = True
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.side_effect = APIConnectionError("network down")
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch.object(ctrl, "get_stripe_api_key", return_value="sk_test_x"),
+			patch.object(ctrl, "convert_to_stripe_amount", return_value=1000),
+			patch.object(frappe, "get_doc", return_value=mandate),
+		):
+			with self.assertRaises(FailedToInitiateFlowError):
+				ctrl._initiate_mandated_charge()
+
+	def test_process_response_for_mandated_charge_sets_status(self):
+		ctrl = self._controller()
+		ctrl.flags = MagicMock()
+		ctrl.state.response.payload = {"status": "succeeded"}
+		self.assertIsNone(ctrl._process_response_for_mandated_charge())
+		self.assertEqual(ctrl.flags.status_changed_to, "succeeded")
+
+	def test_is_server_to_server_true_for_mandated_flow(self):
+		ctrl = self._controller(flow_type="mandated_charge", response_hash=None)
+		self.assertTrue(ctrl._is_server_to_server())
+
+	def test_is_server_to_server_uses_hash_for_charge_flow(self):
+		ctrl = self._controller(flow_type="charge", response_hash=None)
+		self.assertFalse(ctrl._is_server_to_server())
+
+
+class TestStripeChargeMandateE2E(IntegrationTestCase):
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		if not frappe.db.exists("Stripe Settings", "MandateTest"):
+			s = frappe.get_doc(
+				{
+					"doctype": "Stripe Settings",
+					"gateway_name": "MandateTest",
+					"publishable_key": "pk_test_x",
+					"secret_key": "sk_test_x",
+				}
+			)
+			s.flags.ignore_mandatory = True
+			s.insert(ignore_permissions=True)
+		cls.gateway_name = "Stripe-MandateTest"
+		if not frappe.db.exists("Stripe Mandate", {"customer_id": "cus_e2e", "payment_method_id": "pm_e2e"}):
+			cls.mandate = frappe.get_doc(
+				{
+					"doctype": "Stripe Mandate",
+					"gateway_settings": "Stripe Settings",
+					"gateway_controller": "MandateTest",
+					"customer_id": "cus_e2e",
+					"payment_method_id": "pm_e2e",
+					"status": "Active",
+					"payer": "e2e@example.com",
+				}
+			).insert(ignore_permissions=True)
+		else:
+			cls.mandate = frappe.get_doc(
+				"Stripe Mandate", {"customer_id": "cus_e2e", "payment_method_id": "pm_e2e"}
+			)
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: commit the Stripe Mandate fixture so it is visible across this class's test methods
+
+	def _tx(self):
+		from payments.types import TxData
+
+		return TxData(
+			amount=10.0,
+			currency="EUR",
+			reference_doctype="User",
+			reference_docname="Administrator",
+			payer_contact={"email": "e2e@example.com"},
+			payer_address={},
+			loyalty_points=None,
+			discount_amount=None,
+		)
+
+	def _charge_returning(self, intent_status):
+		from payments.controllers import PaymentController
+
+		intent_obj = MagicMock(id="pi_e2e", status=intent_status, customer="cus_e2e", payment_method="pm_e2e")
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.return_value = intent_obj
+		fake_stripe.PaymentIntent.retrieve.return_value = intent_obj
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch(
+				"payments.payment_gateways.doctype.stripe_settings.stripe_settings.StripeSettings.get_stripe_api_key",
+				return_value="sk_test_x",
+			),
+		):
+			return PaymentController.charge_mandate(
+				mandate=self.mandate, tx_data=self._tx(), gateway=self.gateway_name
+			)
+
+	def _charge_raising(self, exc):
+		from payments.controllers import PaymentController
+
+		fake_stripe = MagicMock()
+		fake_stripe.PaymentIntent.create.side_effect = exc
+		with (
+			patch("payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe", fake_stripe),
+			patch(
+				"payments.payment_gateways.doctype.stripe_settings.stripe_settings.StripeSettings.get_stripe_api_key",
+				return_value="sk_test_x",
+			),
+		):
+			return PaymentController.charge_mandate(
+				mandate=self.mandate, tx_data=self._tx(), gateway=self.gateway_name
+			)
+
+	def test_charge_mandate_success(self):
+		result = self._charge_returning("succeeded")
+		self.assertEqual(result.indicator_color, "green")
+
+	def test_charge_mandate_requires_action_returns_url(self):
+		result = self._charge_returning("requires_action")
+		self.assertIn("pay", result.action["href"])
+
+	def test_charge_mandate_declined(self):
+		from stripe.error import CardError
+
+		result = self._charge_raising(CardError("Your card was declined.", None, "card_declined"))
+		self.assertEqual(result.indicator_color, "red")

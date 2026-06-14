@@ -10,8 +10,10 @@ import stripe
 from frappe import _
 from frappe.integrations.utils import create_request_log
 from frappe.utils import call_hook_method, flt, get_url
+from stripe.error import StripeError
 
 from payments.controllers import PaymentController
+from payments.exceptions import FailedToInitiateFlowError
 from payments.types import (
 	FrontendDefaults,
 	GatewayProcessingResponse,
@@ -19,6 +21,7 @@ from payments.types import (
 	Processed,
 	RemoteServerInitiationPayload,
 	SessionStates,
+	SessionType,
 	TxData,
 )
 from payments.utils import create_payment_gateway
@@ -366,6 +369,32 @@ class StripeSettings(PaymentController):
 			return flt(amount)
 		return flt(amount) / 100
 
+	def _ensure_stripe_customer(self, payer_email: str) -> str:
+		"""Return a Stripe Customer id for the payer, reusing an Active mandate's
+		customer when one exists, otherwise creating a fresh Stripe Customer.
+
+		Caching by a more stable payer identity than email is a noted refinement
+		(see spec Risks: Customer lifecycle). Uses the module-global ``stripe``
+		(imported at the top of this file), so tests patch
+		``...stripe_settings.stripe``.
+		"""
+		existing = frappe.get_all(
+			"Stripe Mandate",
+			filters={
+				"payer": payer_email,
+				"status": "Active",
+				"gateway_settings": self.doctype,
+				"gateway_controller": self.name,
+			},
+			fields=["customer_id"],
+			limit=1,
+		)
+		if existing and existing[0].customer_id:
+			return existing[0].customer_id
+		stripe.api_key = self.get_stripe_api_key()
+		customer = stripe.Customer.create(email=payer_email)
+		return customer.id
+
 	def _build_intent_params(self, amount, currency, reference_docname, payer_email="", metadata=None):
 		"""Build the core PaymentIntent parameters shared by legacy and v2 flows."""
 		intent_params = {
@@ -632,6 +661,17 @@ class StripeSettings(PaymentController):
 			},
 		)
 
+		if tx_data.save_mandate:
+			if payer_email:
+				intent_params["customer"] = self._ensure_stripe_customer(payer_email)
+				intent_params["setup_future_usage"] = "off_session"
+			else:
+				frappe.log_error(
+					title="Stripe: save_mandate skipped (no payer email)",
+					message=f"PSL {psl.name} requested save_mandate but payer_contact has no email; "
+					"charging without saving a reusable mandate.",
+				)
+
 		intent = stripe.PaymentIntent.create(
 			**intent_params,
 			idempotency_key=f"psl-{psl.name}",
@@ -650,6 +690,8 @@ class StripeSettings(PaymentController):
 
 	def _validate_response(self) -> None:
 		"""Validate the webhook signature for server-to-server responses."""
+		if self.state.psl.flow_type == SessionType.mandated_charge:
+			return  # synchronous off-session result is self-originated; no re-verification needed
 		response = self.state.response
 
 		# For webhook responses, signature is already validated in stripe_webhook()
@@ -671,15 +713,140 @@ class StripeSettings(PaymentController):
 					payload=intent,
 				)
 
+	@staticmethod
+	def _intent_field(payload, key):
+		"""Read a field from a PaymentIntent payload that may be a dict or a StripeObject."""
+		if isinstance(payload, dict):
+			return payload.get(key)
+		return getattr(payload, key, None)
+
+	def _map_intent_status(self, payload) -> str | None:
+		"""Map a Stripe PaymentIntent payload to our flow status string.
+
+		Shared by the charge and mandated-charge response processors so the
+		dict-or-object access lives in exactly one place.
+		"""
+		return self._intent_field(payload, "status")
+
+	def _persist_mandate(self, payload) -> None:
+		"""Create a Stripe Mandate from a successful saved charge and link it to
+		the PSL. No-op unless both a customer and a payment method were captured.
+
+		Idempotent: a retried ``process_response`` for the same saved payment
+		method reuses the existing mandate instead of creating a duplicate.
+		"""
+		customer_id = self._intent_field(payload, "customer")
+		payment_method_id = self._intent_field(payload, "payment_method")
+		if not (customer_id and payment_method_id):
+			return
+
+		# self.state.psl is a data snapshot (_dict); fetch the document to use set_mandate.
+		psl_doc = frappe.get_doc("Payment Session Log", self.state.psl.name)
+
+		existing = frappe.get_all(
+			"Stripe Mandate",
+			filters={
+				"customer_id": customer_id,
+				"payment_method_id": payment_method_id,
+				"gateway_settings": self.doctype,
+				"gateway_controller": self.name,
+			},
+			fields=["name"],
+			limit=1,
+		)
+		if existing:
+			psl_doc.set_mandate(frappe.get_doc("Stripe Mandate", existing[0].name))
+			return
+
+		mandate = frappe.get_doc(
+			{
+				"doctype": "Stripe Mandate",
+				"gateway_settings": self.doctype,
+				"gateway_controller": self.name,
+				"customer_id": customer_id,
+				"payment_method_id": payment_method_id,
+				# mandate_reference is the SEPA mandate id; Stripe leaves it unset
+				# for card PaymentIntents, so this is None in the card flow.
+				"mandate_reference": self._intent_field(payload, "mandate"),
+				"status": "Active",
+				"payer": self._get_payer_email(self.state.tx_data.payer_contact),
+				"payment_session_log": self.state.psl.name,
+			}
+		)
+		mandate.insert(ignore_permissions=True)
+		psl_doc.set_mandate(mandate)
+
 	def _process_response_for_charge(self) -> Processed | None:
 		"""Process the PaymentIntent response and set status."""
 		payload = self.state.response.payload
-		status = payload.get("status") if isinstance(payload, dict) else payload.status
-
-		# Map Stripe status to our flow states
+		status = self._map_intent_status(payload)
 		self.flags.status_changed_to = status
 
+		if status in self.flowstates.success and self.state.tx_data.save_mandate:
+			self._persist_mandate(payload)
+
 		# Return None to use default processing from PaymentController
+		return None
+
+	def _initiate_mandated_charge(self) -> Initiated:
+		"""Charge a stored Stripe mandate off-session (confirm synchronously).
+
+		Uses the module-global ``stripe`` (top-of-file import); tests patch
+		``...stripe_settings.stripe``. A card decline on an off-session confirm is
+		the normal failure path for recurring charges: Stripe raises CardError,
+		which we convert to FailedToInitiateFlowError so charge_mandate returns a
+		clean Declined rather than a 500.
+
+		``tx_data.mandate`` holds a Stripe Mandate document name (the framework
+		``charge_mandate`` normalises it before initiating).
+		"""
+		tx_data = self.state.tx_data
+		psl = self.state.psl
+		if not tx_data.mandate:
+			raise FailedToInitiateFlowError(_("No mandate is set for this charge."), {"psl": psl.name})
+		mandate = frappe.get_doc("Stripe Mandate", tx_data.mandate)
+		if not mandate.is_usable():
+			raise FailedToInitiateFlowError(
+				_("The stored mandate is no longer usable."),
+				{"mandate": tx_data.mandate, "status": mandate.status},
+			)
+
+		stripe.api_key = self.get_stripe_api_key()
+		stripe.api_version = STRIPE_API_VERSION
+
+		try:
+			intent = stripe.PaymentIntent.create(
+				amount=self.convert_to_stripe_amount(tx_data.amount, tx_data.currency),
+				currency=tx_data.currency.lower(),
+				customer=mandate.customer_id,
+				payment_method=mandate.payment_method_id,
+				off_session=True,
+				confirm=True,
+				metadata={
+					"reference_doctype": tx_data.reference_doctype,
+					"reference_docname": tx_data.reference_docname,
+					"psl_name": psl.name,
+				},
+				idempotency_key=f"psl-{psl.name}",
+			)
+		except StripeError as e:
+			raise FailedToInitiateFlowError(str(e), {"stripe_error": getattr(e, "code", None)}) from e
+
+		return Initiated(
+			correlation_id=intent.id,
+			payload=RemoteServerInitiationPayload(
+				{
+					"id": intent.id,
+					"status": self._intent_field(intent, "status"),
+					"customer": self._intent_field(intent, "customer"),
+					"payment_method": self._intent_field(intent, "payment_method"),
+				}
+			),
+		)
+
+	def _process_response_for_mandated_charge(self) -> Processed | None:
+		"""Process an off-session mandated-charge response. Idempotent."""
+		self.flags.status_changed_to = self._map_intent_status(self.state.response.payload)
 		return None
 
 	def _render_failure_message(self) -> str:
@@ -691,8 +858,11 @@ class StripeSettings(PaymentController):
 		return _("Payment was declined")
 
 	def _is_server_to_server(self) -> bool:
-		"""Check if this is a webhook (server-to-server) call."""
-		# If response has a hash, it came from webhook with signature
+		"""Mandated (off-session) charges never have a client redirect; the
+		interactive charge flow is server-to-server only when the response came
+		from a signed webhook."""
+		if self.state.psl.flow_type == SessionType.mandated_charge:
+			return True
 		return bool(self.state.response.hash)
 
 	# Legacy method for backwards compatibility
