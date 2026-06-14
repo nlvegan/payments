@@ -1000,7 +1000,7 @@ class TestStripeWebhookV2Integration(IntegrationTestCase):
 			settings.insert(ignore_permissions=True)
 		cls.gateway_name = "Stripe-_Test Webhook"
 		cls.settings = frappe.get_doc("Stripe Settings", "_Test Webhook")
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: commit shared class fixtures so they are visible across this class's test methods
 		# Fixtures are committed (visible across this class's test methods); the
 		# `if not exists` guard keeps setUpClass idempotent across re-runs. This
 		# matches the repo's existing test-fixture pattern. No tearDownClass: the
