@@ -2,6 +2,7 @@
 # License: MIT. See LICENSE
 
 import json
+from typing import ClassVar
 from urllib.parse import urlencode
 
 import frappe
@@ -143,6 +144,16 @@ class StripeSettings(PaymentController):
 		pre_authorized=["requires_capture"],
 		processing=["processing", "requires_action", "requires_confirmation"],
 		declined=["canceled", "requires_payment_method"],
+	)
+
+	# Webhook event types routed through PaymentController.process_response when the
+	# event carries metadata.psl_name (v2 flow). Others fall back to legacy handlers.
+	V2_ROUTED_EVENTS: ClassVar[frozenset] = frozenset(
+		{
+			"payment_intent.succeeded",
+			"payment_intent.payment_failed",
+			"payment_intent.canceled",
+		}
 	)
 
 	frontend_defaults = FrontendDefaults(
@@ -475,6 +486,9 @@ class StripeSettings(PaymentController):
 				message=json.dumps(_sanitize_for_logging(data), indent=2),
 			)
 
+		if event_type in self.V2_ROUTED_EVENTS and data.get("metadata", {}).get("psl_name"):
+			return self._process_webhook_via_psl(data)
+
 		if event_type == "payment_intent.succeeded":
 			return self._handle_payment_success(data)
 		elif event_type == "payment_intent.payment_failed":
@@ -494,6 +508,29 @@ class StripeSettings(PaymentController):
 					message=json.dumps(_sanitize_for_logging(data), indent=2),
 				)
 			return {"status": "ignored", "event_type": event_type}
+
+	def _process_webhook_via_psl(self, payment_intent) -> dict:
+		"""Route a v2 (PSL-based) webhook event through the controller pipeline.
+
+		The Stripe signature was already verified in stripe_webhook(); the truthy
+		``hash`` marks this as a verified server-to-server response so the controller
+		skips client-side re-retrieval and applies error muting. process_response
+		resolves its own controller from the PSL and is idempotent via its PSL lock +
+		is_terminal() guard, so redelivery after a terminal state is a no-op.
+
+		``payment_intent["id"]`` is a Stripe schema guarantee (same assumption the
+		legacy _handle_payment_* handlers make). The process_response return value is
+		intentionally discarded — the PSL holds the authoritative outcome (and the
+		muted server-to-server path returns None on internal error).
+		"""
+		psl_name = payment_intent.get("metadata", {}).get("psl_name")
+		response = GatewayProcessingResponse(
+			hash=payment_intent["id"].encode(),
+			message=None,
+			payload=payment_intent,
+		)
+		PaymentController.process_response(psl_name, response)
+		return {"status": "processed", "psl_name": psl_name}
 
 	def _handle_payment_success(self, payment_intent):
 		"""Handle successful payment."""
