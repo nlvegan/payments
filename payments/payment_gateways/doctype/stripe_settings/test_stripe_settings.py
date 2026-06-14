@@ -1479,7 +1479,7 @@ class TestStripeChargeMandateE2E(IntegrationTestCase):
 			cls.mandate = frappe.get_doc(
 				"Stripe Mandate", {"customer_id": "cus_e2e", "payment_method_id": "pm_e2e"}
 			)
-		frappe.db.commit()
+		frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: commit the Stripe Mandate fixture so it is visible across this class's test methods
 
 	def _tx(self):
 		from payments.types import TxData
