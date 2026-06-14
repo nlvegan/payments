@@ -40,7 +40,7 @@ class TestStripeSettingsLive(IntegrationTestCase):
 		# Stripe. Raw delete bypasses PSL-link checks and on_trash.
 		if cls.has_credentials:
 			frappe.db.delete("Stripe Mandate", {"gateway_controller": TEST_SETTINGS_NAME})
-			frappe.db.commit()
+			frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: persist the clean-slate purge before the live test run
 
 	@classmethod
 	def tearDownClass(cls):
@@ -48,10 +48,8 @@ class TestStripeSettingsLive(IntegrationTestCase):
 		# suites' stripe_webhook() get_all("Stripe Settings", limit=1) selection.
 		try:
 			if cls.has_credentials and frappe.db.exists("Stripe Settings", TEST_SETTINGS_NAME):
-				frappe.delete_doc(
-					"Stripe Settings", TEST_SETTINGS_NAME, force=True, ignore_permissions=True
-				)
-				frappe.db.commit()
+				frappe.delete_doc("Stripe Settings", TEST_SETTINGS_NAME, force=True, ignore_permissions=True)
+				frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: persist teardown cleanup of the live test settings doc
 		except Exception:
 			pass
 		super().tearDownClass()
@@ -85,7 +83,7 @@ class TestStripeSettingsLive(IntegrationTestCase):
 		# so no stale Active mandate survives into the next test or run.
 		try:
 			frappe.db.delete("Stripe Mandate", {"gateway_controller": TEST_SETTINGS_NAME})
-			frappe.db.commit()
+			frappe.db.commit()  # nosemgrep: frappe-manual-commit,Dont-commit - intentional: persist per-test mandate cleanup against the live Stripe sandbox
 		except Exception:
 			pass
 		super().tearDown()

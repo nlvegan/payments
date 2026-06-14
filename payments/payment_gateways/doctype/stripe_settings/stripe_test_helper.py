@@ -43,7 +43,7 @@ def ensure_stripe_test_credentials() -> str | None:
 	settings.flags.ignore_mandatory = True
 	settings.flags.ignore_validate = True
 	settings.save(ignore_permissions=True)
-	frappe.db.commit()
+	frappe.db.commit()  # nosemgrep: frappe-manual-commit - persist the provisioned test settings so live tests in other transactions can use it
 
 	frappe.clear_document_cache("Stripe Settings", TEST_SETTINGS_NAME)
 	return TEST_SETTINGS_NAME
