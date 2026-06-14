@@ -924,3 +924,180 @@ class TestStripeFlowstates(unittest.TestCase):
 		)
 		# Check for duplicates
 		self.assertEqual(len(all_states), len(set(all_states)))
+
+
+class TestStripeWebhookRouting(unittest.TestCase):
+	"""Dual-path dispatch: v2 events (with psl_name) -> process_response; else legacy."""
+
+	def _ctrl(self):
+		from payments.payment_gateways.doctype.stripe_settings.stripe_settings import StripeSettings
+
+		ctrl = StripeSettings.__new__(StripeSettings)
+		ctrl.enable_debug_logging = 0
+		return ctrl
+
+	def test_v2_event_routes_to_psl_handler(self):
+		ctrl = self._ctrl()
+		event = {
+			"type": "payment_intent.succeeded",
+			"data": {"object": {"id": "pi_1", "status": "succeeded", "metadata": {"psl_name": "PSL-1"}}},
+		}
+		with (
+			patch.object(ctrl, "_process_webhook_via_psl", return_value={"status": "processed"}) as via_psl,
+			patch.object(ctrl, "_handle_payment_success") as legacy,
+		):
+			ctrl.handle_webhook_event(event)
+		via_psl.assert_called_once_with(event["data"]["object"])
+		legacy.assert_not_called()
+
+	def test_event_without_psl_name_routes_to_legacy(self):
+		ctrl = self._ctrl()
+		event = {
+			"type": "payment_intent.succeeded",
+			"data": {
+				"object": {"id": "pi_1", "status": "succeeded", "metadata": {"integration_request": "IR-1"}}
+			},
+		}
+		with (
+			patch.object(ctrl, "_process_webhook_via_psl") as via_psl,
+			patch.object(ctrl, "_handle_payment_success", return_value={"status": "success"}) as legacy,
+		):
+			ctrl.handle_webhook_event(event)
+		legacy.assert_called_once()
+		via_psl.assert_not_called()
+
+	def test_process_webhook_via_psl_builds_response_and_calls_process_response(self):
+		ctrl = self._ctrl()
+		intent = {"id": "pi_1", "status": "succeeded", "metadata": {"psl_name": "PSL-1"}}
+		with patch("payments.controllers.PaymentController.process_response") as pr:
+			result = ctrl._process_webhook_via_psl(intent)
+		pr.assert_called_once()
+		psl_name_arg, response_arg = pr.call_args[0]
+		self.assertEqual(psl_name_arg, "PSL-1")
+		self.assertEqual(response_arg.hash, b"pi_1")
+		self.assertEqual(response_arg.payload, intent)
+		self.assertEqual(result, {"status": "processed", "psl_name": "PSL-1"})
+
+
+class TestStripeWebhookV2Integration(IntegrationTestCase):
+	"""End-to-end: a v2 webhook event drives the PSL to a terminal state via process_response."""
+
+	STRIPE_PATH = "payments.payment_gateways.doctype.stripe_settings.stripe_settings.stripe"
+
+	@classmethod
+	def setUpClass(cls):
+		super().setUpClass()
+		if not frappe.db.exists("Stripe Settings", "_Test Webhook"):
+			settings = frappe.get_doc(
+				{
+					"doctype": "Stripe Settings",
+					"gateway_name": "_Test Webhook",
+					"publishable_key": "pk_test_webhook",
+					"secret_key": "sk_test_webhook",
+				}
+			)
+			settings.flags.ignore_mandatory = True
+			settings.insert(ignore_permissions=True)
+		cls.gateway_name = "Stripe-_Test Webhook"
+		cls.settings = frappe.get_doc("Stripe Settings", "_Test Webhook")
+		frappe.db.commit()
+		# Fixtures are committed (visible across this class's test methods); the
+		# `if not exists` guard keeps setUpClass idempotent across re-runs. This
+		# matches the repo's existing test-fixture pattern. No tearDownClass: the
+		# PSLs the tests create reference the auto-created Payment Gateway, so
+		# deleting it would raise LinkExistsError.
+
+	def _make_tx_data(self):
+		from payments.types import TxData
+
+		return TxData(
+			amount=25.00,
+			currency="USD",
+			reference_doctype="User",
+			reference_docname="Administrator",
+			payer_contact={"email_id": "webhook@example.com"},
+			payer_address={},
+			loyalty_points=None,
+			discount_amount=None,
+		)
+
+	def _mock_intent(self, status="succeeded", id="pi_wh_1"):
+		intent = MagicMock()
+		intent.id = id
+		intent.client_secret = f"{id}_secret"
+		intent.status = status
+		return intent
+
+	def _initiated_psl(self, intent_id="pi_wh_1"):
+		"""initiate + proceed -> a PSL in Initiated state for the Stripe gateway."""
+		from payments.controllers import PaymentController
+
+		with patch(self.STRIPE_PATH) as mock_stripe:
+			mock_stripe.PaymentIntent.create.return_value = self._mock_intent(id=intent_id)
+			_controller, psl_name = PaymentController.initiate(self._make_tx_data(), self.gateway_name)
+			PaymentController.proceed(psl_name)
+		return psl_name
+
+	def _webhook_event(self, psl_name, event_type, status, intent_id="pi_wh_1", **object_extra):
+		obj = {"id": intent_id, "status": status, "metadata": {"psl_name": psl_name}}
+		obj.update(object_extra)
+		return {"type": event_type, "data": {"object": obj}}
+
+	def test_webhook_success_marks_psl_paid(self):
+		psl_name = self._initiated_psl("pi_success")
+		event = self._webhook_event(psl_name, "payment_intent.succeeded", "succeeded", intent_id="pi_success")
+		with patch(self.STRIPE_PATH) as mock_stripe:
+			mock_stripe.PaymentIntent.retrieve.side_effect = AssertionError(
+				"webhook path must not call PaymentIntent.retrieve"
+			)
+			self.settings.handle_webhook_event(event)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Paid")
+
+	def test_webhook_failed_marks_psl_declined(self):
+		psl_name = self._initiated_psl("pi_failed")
+		event = self._webhook_event(
+			psl_name,
+			"payment_intent.payment_failed",
+			"requires_payment_method",
+			intent_id="pi_failed",
+			last_payment_error={"message": "Your card was declined."},
+		)
+		with patch(self.STRIPE_PATH):
+			self.settings.handle_webhook_event(event)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Declined")
+
+	def test_webhook_canceled_marks_psl_declined(self):
+		psl_name = self._initiated_psl("pi_canceled")
+		event = self._webhook_event(psl_name, "payment_intent.canceled", "canceled", intent_id="pi_canceled")
+		with patch(self.STRIPE_PATH):
+			self.settings.handle_webhook_event(event)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Declined")
+
+	def test_webhook_redelivery_is_idempotent(self):
+		psl_name = self._initiated_psl("pi_idem")
+		event = self._webhook_event(psl_name, "payment_intent.succeeded", "succeeded", intent_id="pi_idem")
+		with patch(self.STRIPE_PATH):
+			self.settings.handle_webhook_event(event)
+			self.settings.handle_webhook_event(event)
+		self.assertEqual(frappe.get_doc("Payment Session Log", psl_name).status, "Paid")
+
+	def test_legacy_event_without_psl_name_does_not_touch_psl_path(self):
+		event = {
+			"type": "payment_intent.succeeded",
+			"data": {
+				"object": {
+					"id": "pi_legacy",
+					"status": "succeeded",
+					"metadata": {"integration_request": "IR-x"},
+				}
+			},
+		}
+		with (
+			patch.object(self.settings, "_process_webhook_via_psl") as via_psl,
+			patch.object(
+				self.settings, "_handle_payment_success", return_value={"status": "success"}
+			) as legacy,
+		):
+			self.settings.handle_webhook_event(event)
+		via_psl.assert_not_called()
+		legacy.assert_called_once()
