@@ -697,6 +697,7 @@ def get_gateway_controller(doctype, docname, payment_gateway=None):
 	return None
 
 
+# nosemgrep: guest-whitelisted-method - public Stripe webhook endpoint; payload authenticity enforced via signature verification inside the handler
 @frappe.whitelist(allow_guest=True, methods=["POST"])
 def stripe_webhook():
 	"""

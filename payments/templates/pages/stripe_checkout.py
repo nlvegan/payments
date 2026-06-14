@@ -169,8 +169,9 @@ def get_context(context):
 	)
 
 
+# nosemgrep: guest-whitelisted-method - public Stripe checkout endpoint; amount/currency are validated server-side against the reference document (Issue #148)
 @frappe.whitelist(allow_guest=True)
-def create_payment_intent(data):
+def create_payment_intent(data: str | dict):
 	"""
 	Create a PaymentIntent on the server side.
 
@@ -203,8 +204,9 @@ def create_payment_intent(data):
 	return stripe_settings.create_payment_intent(data)
 
 
+# nosemgrep: guest-whitelisted-method - public Stripe checkout fallback; only resolves redirect URL, business logic handled by signature-verified webhook
 @frappe.whitelist(allow_guest=True)
-def confirm_payment(payment_intent_id, reference_doctype, reference_docname):
+def confirm_payment(payment_intent_id: str, reference_doctype: str, reference_docname: str):
 	"""
 	Confirm that a payment was successful (called from frontend after Stripe confirms).
 
