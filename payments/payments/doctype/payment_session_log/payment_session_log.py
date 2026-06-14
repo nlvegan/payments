@@ -26,10 +26,6 @@ class PSLState(TypedDict):
 
 
 class PaymentSessionLog(Document):
-	# TODO: Remove vestigial `mandate` field from payment_session_log.json
-	# The mandate system was removed from PaymentController but the DocType field
-	# remains to avoid a schema migration. Clean up when convenient.
-
 	# begin: auto-generated types
 	# This code is auto-generated. Do not modify anything in this block.
 
@@ -141,6 +137,20 @@ class PaymentSessionLog(Document):
 			self.log_error("No button selected yet")
 			frappe.throw(_("No button selected for this payment session"))
 		return frappe.get_cached_doc("Payment Button", self.button)
+
+	def set_mandate(self, mandate) -> None:
+		"""Store a reference to a PaymentMandate as {doctype, name} JSON."""
+		if hasattr(mandate, "doctype"):
+			ref = {"doctype": mandate.doctype, "name": mandate.name}
+		else:
+			ref = {"doctype": mandate["doctype"], "name": mandate["name"]}
+		self.db_set("mandate", json.dumps(ref), commit=True)
+
+	def get_mandate(self) -> dict | None:
+		"""Return the stored mandate ref as a dict, or None."""
+		if not self.mandate:
+			return None
+		return json.loads(self.mandate)
 
 	@staticmethod
 	def clear_old_logs(days=90):

@@ -227,6 +227,29 @@ class PaymentController(Document):
 		psl.update_gateway_specific_state(data, "Data Capture")
 		return data
 
+	def _run_initiation(self, psl, flow_type) -> Initiated:
+		"""Shared initiate->persist primitive used by both proceed() (interactive)
+		and charge_mandate() (headless).
+
+		Calls the flow's _initiate_* method, persists correlation_id + initiation
+		payload + flow_type, and returns the Initiated result. Raises on failure
+		for the caller to present (proceed() redirects; charge_mandate() returns a
+		Processed). Keeps the initiate path in exactly one place.
+		"""
+		frappe.flags.integration_request_doc = psl  # for linking error logs
+		method_name = self._INITIATE_DISPATCH[flow_type]
+		initiated = getattr(self, method_name)()
+		psl.db_set(
+			{
+				"processing_response_payload": None,  # in case of a reset
+				"flow_type": flow_type,
+				"correlation_id": initiated.correlation_id,
+			},
+			commit=True,
+		)
+		psl.set_initiation_payload(initiated.payload, "Initiated")  # commits
+		return initiated
+
 	@staticmethod
 	def proceed(psl_name: PSLName, updated_tx_data: TxData = None) -> Proceeded:
 		"""Call this when the user agreed to proceed with the payment to initiate the capture with
@@ -279,18 +302,7 @@ class PaymentController(Document):
 		self.state.tx_data = self._patch_tx_data(self.state.tx_data)
 
 		try:
-			frappe.flags.integration_request_doc = psl  # for linking error logs
-
-			initiated = self._initiate_charge()
-			psl.db_set(
-				{
-					"processing_response_payload": None,  # in case of a reset
-					"flow_type": SessionType.charge,
-					"correlation_id": initiated.correlation_id,
-				},
-				commit=True,
-			)
-			psl.set_initiation_payload(initiated.payload, "Initiated")  # commits
+			initiated = self._run_initiation(psl, SessionType.charge)
 			return Proceeded(
 				integration=self.doctype,
 				psltype=SessionType.charge,
@@ -333,6 +345,61 @@ class PaymentController(Document):
 		the template context from this projection instead of the raw doc.
 		"""
 		return {}
+
+	@staticmethod
+	def charge_mandate(mandate, tx_data: TxData, gateway=None) -> Processed:
+		"""Charge a stored mandate off-session, server-side (no /pay page).
+
+		Trusted backend entry point (NOT whitelisted). Creates a mandated_charge
+		session, runs the shared initiation core (which for supporting gateways
+		confirms synchronously), and feeds the result through the normal pipeline.
+
+		On the gateway signalling that customer action is required, returns a
+		Processed whose action points at the /pay URL so the caller can send a
+		re-authentication link. On initiation failure, returns a Declined-style
+		Processed.
+		"""
+		# Normalise the mandate ref onto tx_data so the gateway reads it back.
+		if hasattr(mandate, "name"):
+			tx_data.mandate = mandate.name
+		elif isinstance(mandate, dict):
+			tx_data.mandate = mandate.get("name")
+		else:
+			tx_data.mandate = mandate
+
+		self, psl_name = PaymentController.initiate(tx_data, gateway)
+		psl: PaymentSessionLog = frappe.get_doc("Payment Session Log", psl_name)
+		if hasattr(mandate, "name") or isinstance(mandate, dict):
+			psl.set_mandate(mandate)
+
+		self.state = psl.load_state()
+		self.state.tx_data = self._patch_tx_data(self.state.tx_data)
+
+		try:
+			initiated = self._run_initiation(psl, SessionType.mandated_charge)
+		except FailedToInitiateFlowError as err:
+			psl.set_initiation_payload(err.data, "Declined")
+			return Processed(
+				message=_("The mandate could not be charged. A new authorization may be required."),
+				action=dict(href=PaymentController.get_payment_url(psl.name), label=_("Re-authorize")),
+				status_changed_to="Declined",
+				indicator_color="red",
+				payload={},
+			)
+
+		# Customer-action required: cannot complete head-less; hand back a payment link.
+		if initiated.payload.get("status") in self.flowstates.processing:
+			return Processed(
+				message=_("Additional authorization is required to complete this charge."),
+				action=dict(href=PaymentController.get_payment_url(psl.name), label=_("Authorize")),
+				status_changed_to="Processing",
+				indicator_color="yellow",
+				payload=initiated.payload,
+			)
+
+		# Otherwise feed the synchronous result straight into the normal pipeline.
+		response = GatewayProcessingResponse(hash=None, message=None, payload=initiated.payload)
+		return PaymentController.process_response(psl.name, response)
 
 	def _get_support_email(self):
 		"""Look up the support email for the reference document, falling back to default incoming."""
@@ -387,16 +454,38 @@ class PaymentController(Document):
 		),
 	}
 
+	# flow_type -> initiation method name (parallels _FLOW_DISPATCH for processing)
+	_INITIATE_DISPATCH: ClassVar[dict] = {
+		SessionType.charge: "_initiate_charge",
+		SessionType.mandated_charge: "_initiate_mandated_charge",
+	}
+
+	# flow_type -> (process_method_name, refdoc_hook_name, human_label)
+	# Resolved via getattr(self, ...) at call time so gateways can override.
+	# Unset/unrecognised flow_type falls back to the charge entry.
+	_FLOW_DISPATCH: ClassVar[dict] = {
+		SessionType.charge: ("_process_response_for_charge", "on_payment_charge_processed", "charge"),
+		SessionType.mandated_charge: (
+			# _process_response_for_mandated_charge contract is added with the mandate impl
+			"_process_response_for_mandated_charge",
+			"on_payment_mandated_charge_processed",
+			"mandated charge",
+		),
+	}
+
 	def _process_response(self, psl: PaymentSessionLog, ref_doc: Document) -> Processed:
 		self._validate_response()
 
+		flow = self.state.psl.flow_type or SessionType.charge
+		process_method_name, hookmethod, flow_label = self._FLOW_DISPATCH.get(
+			flow, self._FLOW_DISPATCH[SessionType.charge]
+		)
+
 		processed = None
 		try:
-			processed = self._process_response_for_charge()  # idempotent on second run
+			processed = getattr(self, process_method_name)()  # idempotent on second run
 		except Exception as e:
-			raise PaymentControllerProcessingError(
-				f"{self._process_response_for_charge} failed", "charge"
-			) from e
+			raise PaymentControllerProcessingError(f"{process_method_name} failed", flow_label) from e
 
 		all_states = (
 			self.flowstates.success
@@ -429,7 +518,7 @@ class PaymentController(Document):
 				psl.set_processing_payload(self.state.response, psl_status)  # commits
 				ret["indicator_color"] = color
 				processed = processed or Processed(
-					message=_(msg_template).format("charge".title()),
+					message=_(msg_template).format(flow_label.title()),
 					action=dict(action_label, label=_(action_label["label"])),
 					**ret,
 				)
@@ -462,17 +551,27 @@ class PaymentController(Document):
 				fallback_action=dict(href=PaymentController.get_payment_url(psl.name), label=_("Refresh")),
 			)
 			processed = processed or Processed(
-				message=_("{} declined").format("charge".title()),
+				message=_("{} declined").format(flow_label.title()),
 				action=action,
 				**ret,
 			)
 
-		return self._invoke_ref_doc_hook(ref_doc, changed, ret, processed)
+		return self._invoke_ref_doc_hook(ref_doc, changed, ret, processed, hookmethod, flow_label)
 
 	def _invoke_ref_doc_hook(
-		self, ref_doc: Document, changed: bool, ret: dict, processed: Processed
+		self,
+		ref_doc: Document,
+		changed: bool,
+		ret: dict,
+		processed: Processed,
+		hookmethod: str,
+		flow_label: str,
 	) -> Processed:
-		"""Invoke the optional ``on_payment_charge_processed`` hook on the ref doc.
+		"""Invoke the optional flow-specific ref-doc hook (e.g. on_payment_charge_processed).
+
+		``hookmethod`` and ``flow_label`` are resolved from ``_FLOW_DISPATCH`` by
+		``_process_response`` and passed in, so this serves the charge and
+		mandated-charge flows alike.
 
 		The hook is optional (for smoother adoption); when present it may override
 		the default ``processed`` value built by ``_process_response``. Any failure
@@ -481,7 +580,6 @@ class PaymentController(Document):
 
 		Returns the (possibly overridden) ``Processed``.
 		"""
-		hookmethod = "on_payment_charge_processed"
 		has_hook = hasattr(ref_doc, hookmethod) and callable(getattr(ref_doc, hookmethod, None))
 
 		if not has_hook:
@@ -515,7 +613,7 @@ class PaymentController(Document):
 					"indicator": "red",
 				}
 			]
-			raise RefDocHookProcessingError("RefDoc hook processing failed", "charge") from e
+			raise RefDocHookProcessingError("RefDoc hook processing failed", flow_label) from e
 
 		return processed
 
@@ -680,6 +778,29 @@ class PaymentController(Document):
 
 	def _process_response_for_charge(self) -> Processed | None:
 		"""Implement how the controller should process charge responses
+
+		Needs to be idempotent.
+
+		Implementations can read:
+		- self.state.psl
+		- self.state.tx_data
+		- self.state.response
+		"""
+		raise NotImplementedError
+
+	def _initiate_mandated_charge(self) -> Initiated:
+		"""Invoked by charge_mandate to initiate an off-session charge against a stored mandate.
+
+		Implementations can read:
+		- self.state.psl
+		- self.state.tx_data  (tx_data.mandate holds the PaymentMandate ref)
+
+		Should confirm synchronously where the gateway supports it.
+		"""
+		raise NotImplementedError
+
+	def _process_response_for_mandated_charge(self) -> Processed | None:
+		"""Implement how the controller should process off-session mandated-charge responses.
 
 		Needs to be idempotent.
 

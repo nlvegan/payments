@@ -10,6 +10,7 @@ import frappe
 from frappe import _
 
 from payments.controllers import PaymentController
+from payments.exceptions import FailedToInitiateFlowError
 from payments.types import (
 	FrontendDefaults,
 	Initiated,
@@ -58,3 +59,23 @@ class PaymentDemoSettings(PaymentController):
 
 	def _is_server_to_server(self) -> bool:
 		return bool(self.state.response.payload.get("s2s"))
+
+	def _initiate_mandated_charge(self) -> Initiated:
+		psl = self.state.psl
+		mandate_ref = self.state.tx_data.mandate
+		# Deterministic simulation keyed on the mandate ref string:
+		#   "revoked"          -> initiation failure
+		#   "requires_action"  -> needs customer action (maps to flowstates.processing)
+		#   anything else      -> success
+		if mandate_ref == "revoked":
+			raise FailedToInitiateFlowError("Mandate not usable", {"mandate": mandate_ref})
+		status = "pending" if mandate_ref == "requires_action" else "succeeded"
+		return Initiated(
+			correlation_id=f"demo-mc-{psl.name}",
+			payload=RemoteServerInitiationPayload({"status": status, "s2s": True, "psl": psl.name}),
+		)
+
+	def _process_response_for_mandated_charge(self) -> Processed | None:
+		payload = self.state.response.payload
+		self.flags.status_changed_to = payload.get("status", "succeeded")
+		return None
